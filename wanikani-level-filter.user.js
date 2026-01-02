@@ -2,7 +2,7 @@
 // @name         WaniKani Level Filter
 // @namespace    wanikani-level-filter
 // @description  Filter reviews by level during active review sessions
-// @version      1.0.1
+// @version      1.0.2
 // @author       doutatsu
 // @match        https://www.wanikani.com/*
 // @match        https://preview.wanikani.com/*
@@ -82,7 +82,7 @@
             position: fixed;
             top: 80px;
             left: 50%;
-            transform: translateX(-50%);
+            transform: translate(-50%, 0);
             background: #4a90e2;
             color: white;
             padding: 12px 24px;
@@ -91,7 +91,7 @@
             font-size: 14px;
             font-weight: 500;
             box-shadow: 0 2px 8px rgba(0,0,0,0.2);
-            animation: slideDown 0.3s ease;
+            animation: wkLevelFilterSlideDown 0.3s ease;
         `
     };
 
@@ -110,6 +110,16 @@
         body.${EMPTY_QUEUE_CLASS} #${UI_IDS.noItemsMessage} {
             display: block !important;
         }
+
+        @keyframes wkLevelFilterSlideDown {
+            from { opacity: 0; transform: translate(-50%, -10px); }
+            to { opacity: 1; transform: translate(-50%, 0); }
+        }
+
+        @keyframes wkLevelFilterSlideUp {
+            from { opacity: 1; transform: translate(-50%, 0); }
+            to { opacity: 0; transform: translate(-50%, -10px); }
+        }
     `;
 
     // ============================================
@@ -125,7 +135,10 @@
         currentQueueLevels: new Set(),
         currentQueueLevelCounts: {},
         // Track if user intentionally clicked home button
-        userClickedHome: false
+        userClickedHome: false,
+        // Avoid registering multiple filters on turbo navigation
+        queueFilterOwner: null,
+        queueFilterRegistered: false
     };
 
     // ============================================
@@ -164,6 +177,10 @@
      * @returns {Promise<Object>} Object with level counts
      */
     function loadItemDataWithLevels() {
+        state.subjectLevelMap = {};
+        state.availableLevels = [];
+        state.levelCounts = {};
+
         const config = {
             wk_items: {
                 options: {
@@ -195,6 +212,10 @@
     function buildSubjectLevelMap(items) {
         state.subjectLevelMap = {};
         items.forEach(item => {
+            if (!item || !item.data || !Number.isFinite(item.data.level)) {
+                return;
+            }
+
             state.subjectLevelMap[item.id] = item.data.level;
         });
     }
@@ -290,7 +311,8 @@
 
         const label = createElement('label', {
             text: 'Level:',
-            cssText: STYLES.label
+            cssText: STYLES.label,
+            attrs: { for: UI_IDS.dropdown }
         });
 
         container.appendChild(label);
@@ -320,6 +342,7 @@
         const dropdown = document.createElement('select');
         dropdown.id = UI_IDS.dropdown;
         dropdown.style.cssText = STYLES.dropdown;
+        dropdown.setAttribute('aria-label', 'Filter by level');
 
         // Add "All Levels" option with total count
         const totalCount = Object.values(counts).reduce((sum, count) => sum + count, 0);
@@ -330,7 +353,11 @@
 
         // Add individual level options with counts
         // Only show levels that have items available
-        state.availableLevels.forEach(level => {
+        const levelsToShow = state.availableLevels.length > 0
+            ? state.availableLevels
+            : Object.keys(counts).map(Number).sort((a, b) => a - b);
+
+        levelsToShow.forEach(level => {
             const count = counts[level] || 0;
             if (count > 0) {
                 const option = document.createElement('option');
@@ -397,7 +424,8 @@
         });
 
         // Restore selection if it still exists, otherwise keep current
-        if (currentValue === 'all' || counts[parseInt(currentValue)] > 0) {
+        const parsedValue = Number.parseInt(currentValue, 10);
+        if (currentValue === 'all' || (Number.isFinite(parsedValue) && counts[parsedValue] > 0)) {
             state.dropdown.value = currentValue;
         } else {
             // Current level no longer has items, this shouldn't happen
@@ -455,10 +483,16 @@
             return;
         }
 
-        if (state.availableLevels.length > 0) {
-            state.dropdown = createLevelDropdown(state.levelCounts);
-            insertDropdownIntoPage(state.dropdown);
+        const counts = Object.keys(state.levelCounts).length > 0
+            ? state.levelCounts
+            : state.currentQueueLevelCounts;
+
+        if (Object.keys(counts).length === 0) {
+            return;
         }
+
+        state.dropdown = createLevelDropdown(counts);
+        insertDropdownIntoPage(state.dropdown);
     }
 
     // ============================================
@@ -469,7 +503,11 @@
      * Setup queue manipulation using wkQueue
      */
     function setupQueueFilter() {
-        if (!window.wkQueue) {
+        if (!window.wkQueue || !window.wkQueue.addTotalChange) {
+            return;
+        }
+
+        if (state.queueFilterOwner === window.wkQueue && state.queueFilterRegistered) {
             return;
         }
 
@@ -479,6 +517,8 @@
             openFrameworkGetItemsConfig: 'assignments'
         });
 
+        state.queueFilterOwner = window.wkQueue;
+        state.queueFilterRegistered = true;
     }
 
     /**
@@ -495,14 +535,17 @@
         state.currentQueueLevels.clear();
         state.currentQueueLevelCounts = {};
         for (const queueItem of queue) {
-            const itemLevel = state.subjectLevelMap[queueItem.item.id];
-            if (itemLevel) {
+            const itemLevel = getQueueItemLevel(queueItem);
+            if (itemLevel !== null) {
                 state.currentQueueLevels.add(itemLevel);
                 state.currentQueueLevelCounts[itemLevel] = (state.currentQueueLevelCounts[itemLevel] || 0) + 1;
             }
         }
 
-        // Update dropdown to reflect current queue state
+        // Ensure UI exists and update dropdown to reflect current queue state
+        if (!state.dropdown) {
+            setupUI();
+        }
         updateDropdownOptions();
 
         // If "all" or no selection, return original queue
@@ -510,19 +553,14 @@
             return queue;
         }
 
-        const selectedLevelNum = parseInt(selectedLevel);
+        const selectedLevelNum = Number.parseInt(selectedLevel, 10);
+        if (!Number.isFinite(selectedLevelNum)) {
+            return queue;
+        }
 
         // Filter queue items based on level
         const filteredQueue = queue.filter(queueItem => {
-            // queueItem.item is the WKOF subject object
-            const item = queueItem.item;
-            const subjectId = item.id;
-            const itemLevel = state.subjectLevelMap[subjectId];
-
-            if (!itemLevel) {
-                return false;
-            }
-
+            const itemLevel = getQueueItemLevel(queueItem);
             return itemLevel === selectedLevelNum;
         });
 
@@ -533,8 +571,7 @@
             if (closestLevel !== null) {
                 // Filter for the new level
                 const newLevelQueue = queue.filter(queueItem => {
-                    const item = queueItem.item;
-                    const itemLevel = state.subjectLevelMap[item.id];
+                    const itemLevel = getQueueItemLevel(queueItem);
                     return itemLevel === closestLevel;
                 });
 
@@ -571,8 +608,8 @@
         // Build a set of levels that actually have items in the current queue
         const levelsWithItems = new Set();
         for (const queueItem of queue) {
-            const itemLevel = state.subjectLevelMap[queueItem.item.id];
-            if (itemLevel && itemLevel !== targetLevel) {
+            const itemLevel = getQueueItemLevel(queueItem);
+            if (itemLevel !== null && itemLevel !== targetLevel) {
                 levelsWithItems.add(itemLevel);
             }
         }
@@ -603,22 +640,49 @@
     // ============================================
 
     /**
+     * Normalize a stored level value to 'all' or a numeric string
+     * @param {string|number|null|undefined} value - Stored or incoming value
+     * @returns {string} Normalized level value
+     */
+    function normalizeSelectedLevel(value) {
+        if (value === null || value === undefined || value === 'all') {
+            return 'all';
+        }
+
+        const stringValue = String(value).trim();
+        if (!/^\d+$/.test(stringValue)) {
+            return 'all';
+        }
+
+        const parsed = Number.parseInt(stringValue, 10);
+        return parsed > 0 ? String(parsed) : 'all';
+    }
+
+    /**
      * Get the currently selected level from localStorage
-     * @returns {string|null} The selected level or 'all'
+     * @returns {string} The selected level or 'all'
      */
     function getSelectedLevel() {
-        return localStorage.getItem(STORAGE_KEY) || 'all';
+        const storedValue = localStorage.getItem(STORAGE_KEY);
+        const normalized = normalizeSelectedLevel(storedValue);
+
+        if (normalized === 'all' && storedValue !== null) {
+            localStorage.removeItem(STORAGE_KEY);
+        }
+
+        return normalized;
     }
 
     /**
      * Save the selected level to localStorage
-     * @param {string} level - The level to save
+     * @param {string|number} level - The level to save
      */
     function saveSelectedLevel(level) {
-        if (level === 'all') {
+        const normalized = normalizeSelectedLevel(level);
+        if (normalized === 'all') {
             localStorage.removeItem(STORAGE_KEY);
         } else {
-            localStorage.setItem(STORAGE_KEY, level);
+            localStorage.setItem(STORAGE_KEY, normalized);
         }
     }
 
@@ -671,7 +735,7 @@
 
         // Auto-remove after 3 seconds
         setTimeout(() => {
-            notification.style.animation = 'slideUp 0.3s ease';
+            notification.style.animation = 'wkLevelFilterSlideUp 0.3s ease';
             setTimeout(() => notification.remove(), 300);
         }, 3000);
     }
@@ -723,7 +787,8 @@
             const selectedLevel = getSelectedLevel();
             if (!selectedLevel || selectedLevel === 'all') return;
 
-            const selectedLevelNum = parseInt(selectedLevel);
+            const selectedLevelNum = Number.parseInt(selectedLevel, 10);
+            if (!Number.isFinite(selectedLevelNum)) return;
 
             // Check if there are other levels with items in the current queue
             const otherLevels = [...state.currentQueueLevels].filter(l => l !== selectedLevelNum);
@@ -767,6 +832,28 @@
     // ============================================
     // SECTION 10: UTILITY FUNCTIONS
     // ============================================
+
+    /**
+     * Get the level for a queue item, with a fallback to the item data
+     * @param {Object} queueItem - Queue item from wkQueue
+     * @returns {number|null} Level number, or null if unavailable
+     */
+    function getQueueItemLevel(queueItem) {
+        if (!queueItem || !queueItem.item) {
+            return null;
+        }
+
+        const item = queueItem.item;
+        const subjectId = item.id;
+        let level = state.subjectLevelMap[subjectId];
+
+        if (!Number.isFinite(level) && item.data && Number.isFinite(item.data.level)) {
+            level = item.data.level;
+            state.subjectLevelMap[subjectId] = level;
+        }
+
+        return Number.isFinite(level) ? level : null;
+    }
 
     /**
      * Check if the current page is a review page
