@@ -80,7 +80,7 @@
     `,
     notification: `
       position: fixed;
-      top: 80px;
+      top: 20px;
       left: 50%;
       transform: translate(-50%, 0);
       background: #4a90e2;
