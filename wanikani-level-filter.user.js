@@ -146,7 +146,6 @@
     availableLevels: [], // Array of level numbers
     levelCounts: {}, // Object mapping level -> count
     dropdown: null,
-    sortToggle: null,
     initialized: false,
     // Track levels with items in current queue (updated on each filter call)
     currentQueueLevels: new Set(),
@@ -343,8 +342,7 @@
     container.appendChild(dropdown);
 
     // Add the SRS sort-direction toggle next to the dropdown
-    state.sortToggle = createSortToggle();
-    container.appendChild(state.sortToggle);
+    container.appendChild(createSortToggle());
 
     return container;
   }
@@ -384,10 +382,6 @@
    * @param {HTMLButtonElement} button - The toggle button
    */
   function updateSortToggleLabel(button) {
-    if (!button) {
-      return;
-    }
-
     const isDesc = getSortDirection() === SORT_DESC;
     button.textContent = isDesc ? 'SRS ↓' : 'SRS ↑';
     const title = isDesc
@@ -932,25 +926,40 @@
   // ============================================
 
   /**
-   * Get the level for a queue item, with a fallback to the item data
+   * Get a cached numeric value for a queue item, falling back to a fresh read
+   * and caching the result for later lookups.
    * @param {Object} queueItem - Queue item from wkQueue
-   * @returns {number|null} Level number, or null if unavailable
+   * @param {Object} cache - Map of subject_id -> value to read/populate
+   * @param {Function} read - Reads the value from the item when not cached
+   * @returns {number|null} The value, or null if unavailable
    */
-  function getQueueItemLevel(queueItem) {
+  function getCachedQueueItemValue(queueItem, cache, read) {
     if (!queueItem || !queueItem.item) {
       return null;
     }
 
     const item = queueItem.item;
-    const subjectId = item.id;
-    let level = state.subjectLevelMap[subjectId];
+    let value = cache[item.id];
 
-    if (!Number.isFinite(level) && item.data && Number.isFinite(item.data.level)) {
-      level = item.data.level;
-      state.subjectLevelMap[subjectId] = level;
+    if (!Number.isFinite(value)) {
+      const fresh = read(item);
+      if (Number.isFinite(fresh)) {
+        value = fresh;
+        cache[item.id] = value;
+      }
     }
 
-    return Number.isFinite(level) ? level : null;
+    return Number.isFinite(value) ? value : null;
+  }
+
+  /**
+   * Get the level for a queue item, with a fallback to the item data
+   * @param {Object} queueItem - Queue item from wkQueue
+   * @returns {number|null} Level number, or null if unavailable
+   */
+  function getQueueItemLevel(queueItem) {
+    return getCachedQueueItemValue(queueItem, state.subjectLevelMap,
+      item => item.data && item.data.level);
   }
 
   /**
@@ -959,20 +968,8 @@
    * @returns {number|null} SRS stage, or null if unavailable
    */
   function getQueueItemSrs(queueItem) {
-    if (!queueItem || !queueItem.item) {
-      return null;
-    }
-
-    const item = queueItem.item;
-    const subjectId = item.id;
-    let srs = state.subjectSrsMap[subjectId];
-
-    if (!Number.isFinite(srs) && item.assignments && Number.isFinite(item.assignments.srs_stage)) {
-      srs = item.assignments.srs_stage;
-      state.subjectSrsMap[subjectId] = srs;
-    }
-
-    return Number.isFinite(srs) ? srs : null;
+    return getCachedQueueItemValue(queueItem, state.subjectSrsMap,
+      item => item.assignments && item.assignments.srs_stage);
   }
 
   /**
@@ -1076,9 +1073,8 @@
     // Remove empty queue styling
     clearEmptyQueueUI();
 
-    // Reset element references
+    // Reset dropdown reference
     state.dropdown = null;
-    state.sortToggle = null;
   }
 
   // ============================================
