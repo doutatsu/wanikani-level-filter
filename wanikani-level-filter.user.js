@@ -2,7 +2,7 @@
 // @name         WaniKani Level Filter
 // @namespace    wanikani-level-filter
 // @description  Filter reviews by level during active review sessions
-// @version      1.0.2
+// @version      1.1.0
 // @author       doutatsu
 // @match        https://www.wanikani.com/*
 // @match        https://preview.wanikani.com/*
@@ -18,6 +18,9 @@
   // SECTION 1: CONSTANTS & CONFIGURATION
   // ============================================
   const STORAGE_KEY = 'wk-level-filter-selection';
+  const SORT_STORAGE_KEY = 'wk-level-filter-sort-direction';
+  const SORT_DESC = 'desc'; // Highest SRS stage first (default)
+  const SORT_ASC = 'asc';   // Lowest SRS stage first
   const HEADER_CHECK_INTERVAL = 100; // ms
   const HEADER_TIMEOUT = 5000; // ms
   const EMPTY_QUEUE_CLASS = 'level-filter-empty-queue';
@@ -25,6 +28,7 @@
   const UI_IDS = {
     container: 'level-filter-container',
     dropdown: 'level-filter-dropdown',
+    sortToggle: 'level-filter-sort-toggle',
     noItemsMessage: 'level-filter-no-items-message'
   };
 
@@ -38,6 +42,17 @@
       background: white;
       cursor: pointer;
       min-width: 100px;
+    `,
+    sortToggle: `
+      margin: 0;
+      padding: 3px 8px;
+      font-size: 11px;
+      line-height: 1;
+      border: 1px solid #999;
+      border-radius: 3px;
+      background: white;
+      cursor: pointer;
+      white-space: nowrap;
     `,
     containerBase: `
       display: flex;
@@ -127,9 +142,11 @@
   // ============================================
   const state = {
     subjectLevelMap: {},
+    subjectSrsMap: {}, // Map of subject_id -> srs_stage
     availableLevels: [], // Array of level numbers
     levelCounts: {}, // Object mapping level -> count
     dropdown: null,
+    sortToggle: null,
     initialized: false,
     // Track levels with items in current queue (updated on each filter call)
     currentQueueLevels: new Set(),
@@ -178,6 +195,7 @@
    */
   function loadItemDataWithLevels() {
     state.subjectLevelMap = {};
+    state.subjectSrsMap = {};
     state.availableLevels = [];
     state.levelCounts = {};
 
@@ -211,12 +229,18 @@
    */
   function buildSubjectLevelMap(items) {
     state.subjectLevelMap = {};
+    state.subjectSrsMap = {};
     items.forEach(item => {
       if (!item || !item.data || !Number.isFinite(item.data.level)) {
         return;
       }
 
       state.subjectLevelMap[item.id] = item.data.level;
+
+      // Record the SRS stage so the queue can be sorted by it
+      if (item.assignments && Number.isFinite(item.assignments.srs_stage)) {
+        state.subjectSrsMap[item.id] = item.assignments.srs_stage;
+      }
     });
   }
 
@@ -317,7 +341,60 @@
 
     container.appendChild(label);
     container.appendChild(dropdown);
+
+    // Add the SRS sort-direction toggle next to the dropdown
+    state.sortToggle = createSortToggle();
+    container.appendChild(state.sortToggle);
+
     return container;
+  }
+
+  /**
+   * Create the button that toggles SRS sort direction
+   * @returns {HTMLButtonElement} The toggle button element
+   */
+  function createSortToggle() {
+    const button = createElement('button', {
+      id: UI_IDS.sortToggle,
+      cssText: STYLES.sortToggle,
+      attrs: { type: 'button' }
+    });
+
+    updateSortToggleLabel(button);
+
+    button.addEventListener('click', () => {
+      const newDirection = getSortDirection() === SORT_DESC ? SORT_ASC : SORT_DESC;
+      saveSortDirection(newDirection);
+      updateSortToggleLabel(button);
+
+      // Remove empty queue message and class
+      clearEmptyQueueUI();
+
+      // Re-run the filter (and re-sort) by refreshing the queue
+      if (window.wkQueue && window.wkQueue.refresh) {
+        window.wkQueue.refresh();
+      }
+    });
+
+    return button;
+  }
+
+  /**
+   * Update the toggle button's label/tooltip to reflect the current direction
+   * @param {HTMLButtonElement} button - The toggle button
+   */
+  function updateSortToggleLabel(button) {
+    if (!button) {
+      return;
+    }
+
+    const isDesc = getSortDirection() === SORT_DESC;
+    button.textContent = isDesc ? 'SRS ↓' : 'SRS ↑';
+    const title = isDesc
+      ? 'Sorting by SRS: highest first (click for lowest first)'
+      : 'Sorting by SRS: lowest first (click for highest first)';
+    button.title = title;
+    button.setAttribute('aria-label', title);
   }
 
   /**
@@ -548,14 +625,14 @@
     }
     updateDropdownOptions();
 
-    // If "all" or no selection, return original queue
+    // If "all" or no selection, return the full queue sorted by SRS
     if (!selectedLevel || selectedLevel === 'all') {
-      return queue;
+      return sortQueueBySrs(queue);
     }
 
     const selectedLevelNum = Number.parseInt(selectedLevel, 10);
     if (!Number.isFinite(selectedLevelNum)) {
-      return queue;
+      return sortQueueBySrs(queue);
     }
 
     // Filter queue items based on level
@@ -586,7 +663,7 @@
           state.dropdown.value = closestLevel.toString();
         }
 
-        return newLevelQueue;
+        return sortQueueBySrs(newLevelQueue);
       } else {
         // No levels have items at all - show message
         document.body.classList.add(EMPTY_QUEUE_CLASS);
@@ -595,7 +672,7 @@
       }
     }
 
-    return filteredQueue;
+    return sortQueueBySrs(filteredQueue);
   }
 
   /**
@@ -683,6 +760,27 @@
       localStorage.removeItem(STORAGE_KEY);
     } else {
       localStorage.setItem(STORAGE_KEY, normalized);
+    }
+  }
+
+  /**
+   * Get the current SRS sort direction from localStorage
+   * @returns {string} SORT_DESC (default) or SORT_ASC
+   */
+  function getSortDirection() {
+    return localStorage.getItem(SORT_STORAGE_KEY) === SORT_ASC ? SORT_ASC : SORT_DESC;
+  }
+
+  /**
+   * Save the SRS sort direction to localStorage
+   * @param {string} direction - SORT_DESC or SORT_ASC
+   */
+  function saveSortDirection(direction) {
+    if (direction === SORT_ASC) {
+      localStorage.setItem(SORT_STORAGE_KEY, SORT_ASC);
+    } else {
+      // Descending is the default, so no need to persist it
+      localStorage.removeItem(SORT_STORAGE_KEY);
     }
   }
 
@@ -856,6 +954,49 @@
   }
 
   /**
+   * Get the SRS stage for a queue item, with a fallback to the item assignment
+   * @param {Object} queueItem - Queue item from wkQueue
+   * @returns {number|null} SRS stage, or null if unavailable
+   */
+  function getQueueItemSrs(queueItem) {
+    if (!queueItem || !queueItem.item) {
+      return null;
+    }
+
+    const item = queueItem.item;
+    const subjectId = item.id;
+    let srs = state.subjectSrsMap[subjectId];
+
+    if (!Number.isFinite(srs) && item.assignments && Number.isFinite(item.assignments.srs_stage)) {
+      srs = item.assignments.srs_stage;
+      state.subjectSrsMap[subjectId] = srs;
+    }
+
+    return Number.isFinite(srs) ? srs : null;
+  }
+
+  /**
+   * Sort a queue by SRS stage according to the current sort direction.
+   * Returns a new array; items without a known SRS stage are placed last.
+   * @param {Array} queue - The queue to sort
+   * @returns {Array} A new, sorted queue
+   */
+  function sortQueueBySrs(queue) {
+    const factor = getSortDirection() === SORT_ASC ? 1 : -1;
+
+    return [...queue].sort((a, b) => {
+      const srsA = getQueueItemSrs(a);
+      const srsB = getQueueItemSrs(b);
+
+      if (srsA === null && srsB === null) return 0;
+      if (srsA === null) return 1;
+      if (srsB === null) return -1;
+
+      return (srsA - srsB) * factor;
+    });
+  }
+
+  /**
    * Check if the current page is a review page
    * @returns {boolean} True if on review page
    */
@@ -935,8 +1076,9 @@
     // Remove empty queue styling
     clearEmptyQueueUI();
 
-    // Reset dropdown reference
+    // Reset element references
     state.dropdown = null;
+    state.sortToggle = null;
   }
 
   // ============================================
