@@ -6,7 +6,7 @@ A userscript that allows you to filter WaniKani reviews by level during active r
 
 - **Real-time filtering** during active review sessions
 - **Simple dropdown UI** at the top of the review page
-- **SRS sorting** - items are sorted by SRS stage, highest first by default, with a toggle button to switch between descending and ascending
+- **SRS sorting** - items are sorted by SRS stage, highest first by default, with a toggle button that cycles through descending (`SRS ↓`), ascending (`SRS ↑`), and no sorting (`SRS —`, the original random order)
 - **Level persistence** - your selection and sort direction are saved across sessions
 - **Smart queue management** - skipped items are deferred to the end of the queue
 - **Empty queue detection** - warns you if few/no items from the selected level are available
@@ -40,7 +40,7 @@ Alternative: Copy the contents of `wanikani-level-filter.user.js` and create a n
 2. Look for the **"Filter by Level:"** dropdown at the top of the page
 3. Select a level from the dropdown (or choose "All Levels" to disable filtering)
 4. Start your reviews - items from other levels will be automatically skipped
-5. Use the **SRS toggle** next to the dropdown to switch between sorting items by SRS stage highest-first (`SRS ↓`, the default) and lowest-first (`SRS ↑`)
+5. Use the **SRS toggle** next to the dropdown to cycle the sort mode: highest-first (`SRS ↓`, the default) → lowest-first (`SRS ↑`) → no sorting (`SRS —`, original random order)
 6. Your selection and sort direction are saved and will persist across review sessions
 
 ### How It Works

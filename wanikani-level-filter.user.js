@@ -2,7 +2,7 @@
 // @name         WaniKani Level Filter
 // @namespace    wanikani-level-filter
 // @description  Filter reviews by level during active review sessions
-// @version      1.1.0
+// @version      1.2.0
 // @author       doutatsu
 // @match        https://www.wanikani.com/*
 // @match        https://preview.wanikani.com/*
@@ -21,6 +21,27 @@
   const SORT_STORAGE_KEY = 'wk-level-filter-sort-direction';
   const SORT_DESC = 'desc'; // Highest SRS stage first (default)
   const SORT_ASC = 'asc';   // Lowest SRS stage first
+  const SORT_NONE = 'none'; // No sorting - keep the queue's original order
+  // Toggle button label/tooltip per mode; tooltips describe the next click.
+  // Declaration order doubles as the cycle order (see SORT_CYCLE below), so
+  // every mode necessarily has a label.
+  const SORT_LABELS = {
+    [SORT_DESC]: {
+      text: 'SRS ↓',
+      title: 'Sorting by SRS: highest first (click for lowest first)'
+    },
+    [SORT_ASC]: {
+      text: 'SRS ↑',
+      title: 'Sorting by SRS: lowest first (click to disable sorting)'
+    },
+    [SORT_NONE]: {
+      text: 'SRS —',
+      title: 'No SRS sorting: original order (click for highest first)'
+    }
+  };
+  // Order the toggle button cycles through on each click, derived from
+  // SORT_LABELS so the two can never drift apart.
+  const SORT_CYCLE = Object.keys(SORT_LABELS);
   const HEADER_CHECK_INTERVAL = 100; // ms
   const HEADER_TIMEOUT = 5000; // ms
   const EMPTY_QUEUE_CLASS = 'level-filter-empty-queue';
@@ -348,7 +369,7 @@
   }
 
   /**
-   * Create the button that toggles SRS sort direction
+   * Create the button that cycles the SRS sort mode
    * @returns {HTMLButtonElement} The toggle button element
    */
   function createSortToggle() {
@@ -361,8 +382,7 @@
     updateSortToggleLabel(button);
 
     button.addEventListener('click', () => {
-      const newDirection = getSortDirection() === SORT_DESC ? SORT_ASC : SORT_DESC;
-      saveSortDirection(newDirection);
+      saveSortDirection(nextSortDirection(getSortDirection()));
       updateSortToggleLabel(button);
 
       // Remove empty queue message and class
@@ -378,15 +398,13 @@
   }
 
   /**
-   * Update the toggle button's label/tooltip to reflect the current direction
+   * Update the toggle button's label/tooltip to reflect the current sort mode.
+   * Tooltips describe what the next click will do.
    * @param {HTMLButtonElement} button - The toggle button
    */
   function updateSortToggleLabel(button) {
-    const isDesc = getSortDirection() === SORT_DESC;
-    button.textContent = isDesc ? 'SRS ↓' : 'SRS ↑';
-    const title = isDesc
-      ? 'Sorting by SRS: highest first (click for lowest first)'
-      : 'Sorting by SRS: lowest first (click for highest first)';
+    const { text, title } = SORT_LABELS[getSortDirection()];
+    button.textContent = text;
     button.title = title;
     button.setAttribute('aria-label', title);
   }
@@ -769,24 +787,45 @@
   }
 
   /**
-   * Get the current SRS sort direction from localStorage
-   * @returns {string} SORT_DESC (default) or SORT_ASC
+   * Whether a sort mode is a valid, non-default value worth persisting.
+   * Descending is the default and is never stored.
+   * @param {string} direction - The sort mode to test
+   * @returns {boolean} True if the mode should be persisted
    */
-  function getSortDirection() {
-    return localStorage.getItem(SORT_STORAGE_KEY) === SORT_ASC ? SORT_ASC : SORT_DESC;
+  function isPersistedSortDirection(direction) {
+    return SORT_CYCLE.includes(direction) && direction !== SORT_DESC;
   }
 
   /**
-   * Save the SRS sort direction to localStorage
-   * @param {string} direction - SORT_DESC or SORT_ASC
+   * Get the current SRS sort mode from localStorage
+   * @returns {string} SORT_DESC (default), SORT_ASC, or SORT_NONE
+   */
+  function getSortDirection() {
+    const stored = localStorage.getItem(SORT_STORAGE_KEY);
+    return isPersistedSortDirection(stored) ? stored : SORT_DESC;
+  }
+
+  /**
+   * Save the SRS sort mode to localStorage
+   * @param {string} direction - SORT_DESC, SORT_ASC, or SORT_NONE
    */
   function saveSortDirection(direction) {
-    if (direction === SORT_ASC) {
-      localStorage.setItem(SORT_STORAGE_KEY, SORT_ASC);
+    if (isPersistedSortDirection(direction)) {
+      localStorage.setItem(SORT_STORAGE_KEY, direction);
     } else {
       // Descending is the default, so no need to persist it
       localStorage.removeItem(SORT_STORAGE_KEY);
     }
+  }
+
+  /**
+   * Get the next sort mode in the cycle (desc -> asc -> none -> desc)
+   * @param {string} direction - The current sort mode
+   * @returns {string} The next sort mode
+   */
+  function nextSortDirection(direction) {
+    const index = SORT_CYCLE.indexOf(direction);
+    return SORT_CYCLE[(index + 1) % SORT_CYCLE.length];
   }
 
   // ============================================
@@ -984,13 +1023,20 @@
   }
 
   /**
-   * Sort a queue by SRS stage according to the current sort direction.
-   * Returns a new array; items without a known SRS stage are placed last.
+   * Sort a queue by SRS stage according to the current sort mode. When sorting
+   * is off (SORT_NONE) the queue is returned unchanged to preserve its original
+   * (random) order. Otherwise returns a new array with items lacking a known
+   * SRS stage placed last.
    * @param {Array} queue - The queue to sort
-   * @returns {Array} A new, sorted queue
+   * @returns {Array} The queue, sorted or untouched depending on the mode
    */
   function sortQueueBySrs(queue) {
-    const factor = getSortDirection() === SORT_ASC ? 1 : -1;
+    const direction = getSortDirection();
+    if (direction === SORT_NONE) {
+      return queue;
+    }
+
+    const factor = direction === SORT_ASC ? 1 : -1;
 
     return [...queue].sort((a, b) => {
       const srsA = getQueueItemSrs(a);
