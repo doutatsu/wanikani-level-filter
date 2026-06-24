@@ -597,6 +597,17 @@
    * This function is called by wkQueue whenever the queue changes
    */
   function filterQueueByLevel(queue) {
+    // Selection decides which items stay; sorting is applied once, uniformly.
+    return sortQueueBySrs(selectQueueForLevel(queue));
+  }
+
+  /**
+   * Pick the set of queue items to review based on the selected level, updating
+   * the tracking state and UI as a side effect. Returns the (unsorted) queue.
+   * @param {Array} queue - The current review queue
+   * @returns {Array} The queue items to review
+   */
+  function selectQueueForLevel(queue) {
     const selectedLevel = getSelectedLevel();
 
     // Remove empty queue styling first
@@ -619,14 +630,14 @@
     }
     updateDropdownOptions();
 
-    // If "all" or no selection, return the full queue sorted by SRS
+    // If "all" or no selection, return the full queue
     if (!selectedLevel || selectedLevel === 'all') {
-      return sortQueueBySrs(queue);
+      return queue;
     }
 
     const selectedLevelNum = Number.parseInt(selectedLevel, 10);
     if (!Number.isFinite(selectedLevelNum)) {
-      return sortQueueBySrs(queue);
+      return queue;
     }
 
     // Filter queue items based on level
@@ -657,16 +668,16 @@
           state.dropdown.value = closestLevel.toString();
         }
 
-        return sortQueueBySrs(newLevelQueue);
-      } else {
-        // No levels have items at all - show message
-        document.body.classList.add(EMPTY_QUEUE_CLASS);
-        showNoItemsMessage();
-        return queue; // Return original queue to prevent redirect
+        return newLevelQueue;
       }
+
+      // No levels have items at all - show message
+      document.body.classList.add(EMPTY_QUEUE_CLASS);
+      showNoItemsMessage();
+      return queue; // Return original queue to prevent redirect
     }
 
-    return sortQueueBySrs(filteredQueue);
+    return filteredQueue;
   }
 
   /**
