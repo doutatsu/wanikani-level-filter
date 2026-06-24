@@ -24,6 +24,21 @@
   const SORT_NONE = 'none'; // No sorting - keep the queue's original order
   // Order the toggle button cycles through on each click
   const SORT_CYCLE = [SORT_DESC, SORT_ASC, SORT_NONE];
+  // Toggle button label/tooltip per mode; tooltips describe the next click
+  const SORT_LABELS = {
+    [SORT_DESC]: {
+      text: 'SRS ↓',
+      title: 'Sorting by SRS: highest first (click for lowest first)'
+    },
+    [SORT_ASC]: {
+      text: 'SRS ↑',
+      title: 'Sorting by SRS: lowest first (click to disable sorting)'
+    },
+    [SORT_NONE]: {
+      text: 'SRS —',
+      title: 'No SRS sorting: original order (click for highest first)'
+    }
+  };
   const HEADER_CHECK_INTERVAL = 100; // ms
   const HEADER_TIMEOUT = 5000; // ms
   const EMPTY_QUEUE_CLASS = 'level-filter-empty-queue';
@@ -385,22 +400,7 @@
    * @param {HTMLButtonElement} button - The toggle button
    */
   function updateSortToggleLabel(button) {
-    const labels = {
-      [SORT_DESC]: {
-        text: 'SRS ↓',
-        title: 'Sorting by SRS: highest first (click for lowest first)'
-      },
-      [SORT_ASC]: {
-        text: 'SRS ↑',
-        title: 'Sorting by SRS: lowest first (click to disable sorting)'
-      },
-      [SORT_NONE]: {
-        text: 'SRS —',
-        title: 'No SRS sorting: original order (click for highest first)'
-      }
-    };
-
-    const { text, title } = labels[getSortDirection()];
+    const { text, title } = SORT_LABELS[getSortDirection()];
     button.textContent = text;
     button.title = title;
     button.setAttribute('aria-label', title);
@@ -784,12 +784,22 @@
   }
 
   /**
+   * Whether a sort mode is a valid, non-default value worth persisting.
+   * Descending is the default and is never stored.
+   * @param {string} direction - The sort mode to test
+   * @returns {boolean} True if the mode should be persisted
+   */
+  function isPersistedSortDirection(direction) {
+    return SORT_CYCLE.includes(direction) && direction !== SORT_DESC;
+  }
+
+  /**
    * Get the current SRS sort mode from localStorage
    * @returns {string} SORT_DESC (default), SORT_ASC, or SORT_NONE
    */
   function getSortDirection() {
     const stored = localStorage.getItem(SORT_STORAGE_KEY);
-    return (stored === SORT_ASC || stored === SORT_NONE) ? stored : SORT_DESC;
+    return isPersistedSortDirection(stored) ? stored : SORT_DESC;
   }
 
   /**
@@ -797,7 +807,7 @@
    * @param {string} direction - SORT_DESC, SORT_ASC, or SORT_NONE
    */
   function saveSortDirection(direction) {
-    if (direction === SORT_ASC || direction === SORT_NONE) {
+    if (isPersistedSortDirection(direction)) {
       localStorage.setItem(SORT_STORAGE_KEY, direction);
     } else {
       // Descending is the default, so no need to persist it
