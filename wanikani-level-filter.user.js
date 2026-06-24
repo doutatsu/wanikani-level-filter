@@ -22,9 +22,9 @@
   const SORT_DESC = 'desc'; // Highest SRS stage first (default)
   const SORT_ASC = 'asc';   // Lowest SRS stage first
   const SORT_NONE = 'none'; // No sorting - keep the queue's original order
-  // Order the toggle button cycles through on each click
-  const SORT_CYCLE = [SORT_DESC, SORT_ASC, SORT_NONE];
-  // Toggle button label/tooltip per mode; tooltips describe the next click
+  // Toggle button label/tooltip per mode; tooltips describe the next click.
+  // Declaration order doubles as the cycle order (see SORT_CYCLE below), so
+  // every mode necessarily has a label.
   const SORT_LABELS = {
     [SORT_DESC]: {
       text: 'SRS ↓',
@@ -39,6 +39,9 @@
       title: 'No SRS sorting: original order (click for highest first)'
     }
   };
+  // Order the toggle button cycles through on each click, derived from
+  // SORT_LABELS so the two can never drift apart.
+  const SORT_CYCLE = Object.keys(SORT_LABELS);
   const HEADER_CHECK_INTERVAL = 100; // ms
   const HEADER_TIMEOUT = 5000; // ms
   const EMPTY_QUEUE_CLASS = 'level-filter-empty-queue';
