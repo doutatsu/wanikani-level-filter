@@ -8,6 +8,7 @@ A userscript that allows you to filter WaniKani reviews by level during active r
 - **Simple dropdown UI** at the top of the review page
 - **SRS sorting** - items are sorted by SRS stage, highest first by default, with a toggle button that cycles through descending (`SRS ↓`), ascending (`SRS ↑`), and no sorting (`SRS —`, the original random order)
 - **Level persistence** - your selection and sort direction are saved across sessions
+- **Accurate quiz statistics** - the review header's "completed" / "to go" counts and progress bar reflect the selected level instead of the whole session
 - **Smart queue management** - skipped items are deferred to the end of the queue
 - **Empty queue detection** - warns you if few/no items from the selected level are available
 - **Graceful error handling** - continues working even if data loading fails
