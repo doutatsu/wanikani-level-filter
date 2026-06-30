@@ -2,7 +2,7 @@
 // @name         WaniKani Level Filter
 // @namespace    wanikani-level-filter
 // @description  Filter reviews by level during active review sessions
-// @version      1.2.0
+// @version      1.3.0
 // @author       doutatsu
 // @match        https://www.wanikani.com/*
 // @match        https://preview.wanikani.com/*
@@ -171,6 +171,13 @@
     // Track levels with items in current queue (updated on each filter call)
     currentQueueLevels: new Set(),
     currentQueueLevelCounts: {},
+    // Quiz-statistics tracking (see SECTION 10.5). completedByLevel counts the
+    // subjects fully answered this session, keyed by level; sessionLevelTotal
+    // records each level's total for the session (completed + remaining) so the
+    // "completed"/"to go" counts can be recomputed for the selected level.
+    completedByLevel: {},
+    sessionLevelTotal: {},
+    statsListenersRegistered: false,
     // Track if user intentionally clicked home button
     userClickedHome: false,
     // Avoid registering multiple filters on turbo navigation
@@ -204,6 +211,8 @@
   // Setup home button tracking and navigation interceptor early
   setupHomeButtonTracking();
   setupNavigationInterceptor();
+  // Listen for quiz lifecycle events so the per-level statistics stay in sync
+  setupQuizStatisticsTracking();
 
   // ============================================
   // SECTION 4: DATA LOADING FUNCTIONS
@@ -218,6 +227,9 @@
     state.subjectSrsMap = {};
     state.availableLevels = [];
     state.levelCounts = {};
+    // Start the session's statistics tracking from a clean slate
+    state.completedByLevel = {};
+    state.sessionLevelTotal = {};
 
     const config = {
       wk_items: {
@@ -642,6 +654,12 @@
       }
     }
 
+    // The queue handed to us excludes already-finished items, so for each level
+    // (remaining items) + (items completed so far) is that level's session
+    // total. Record it so the statistics can derive the "completed"/"to go"
+    // split for whichever level is selected.
+    captureSessionLevelTotals();
+
     // Ensure UI exists and update dropdown to reflect current queue state
     if (!state.dropdown) {
       setupUI();
@@ -771,6 +789,17 @@
     }
 
     return normalized;
+  }
+
+  /**
+   * Get the selected level as a number, or null when "All Levels" is selected.
+   * getSelectedLevel() (via normalizeSelectedLevel) always yields 'all' or a
+   * positive-integer string, so the parse here never produces NaN.
+   * @returns {number|null} The selected level number, or null for "all"
+   */
+  function getSelectedLevelNumber() {
+    const selectedLevel = getSelectedLevel();
+    return selectedLevel === 'all' ? null : Number.parseInt(selectedLevel, 10);
   }
 
   /**
@@ -1060,6 +1089,169 @@
   }
 
   // ============================================
+  // SECTION 10.5: QUIZ STATISTICS SYNC
+  // ============================================
+  //
+  // WaniKani's review header is driven by two Stimulus controllers:
+  //   - `quiz-statistics` exposes the "completed" and "to go" counts via the
+  //     `completeCount` / `remainingCount` targets (plus `percentCorrect`).
+  //   - `quiz-progress` draws the progress bar via updateProgress({ detail:
+  //     { percentComplete } }).
+  // When the queue is filtered, the Queue Manipulator rewrites the queue and
+  // the `remainingCount` target, but it never touches `completeCount`, and it
+  // resets the quiz's internal item total to the *filtered* length. Once we
+  // auto-switch levels the native code derives the counts from mismatched
+  // numbers (a session-wide "completed" against a per-level total), so both
+  // counts and the progress bar drift. To keep them correct we own the
+  // statistics while a specific level is selected: we count completed subjects
+  // per level ourselves and re-assert completed / to go / progress for the
+  // selected level on every relevant quiz event.
+
+  /**
+   * Resolve a Stimulus controller instance by identifier, or null if Stimulus
+   * or the controller's element is not present.
+   * @param {string} name - The controller identifier (e.g. 'quiz-statistics')
+   * @returns {Object|null} The controller instance, or null
+   */
+  function getStimulusController(name) {
+    const stimulus = window.Stimulus;
+    if (!stimulus || typeof stimulus.getControllerForElementAndIdentifier !== 'function') {
+      return null;
+    }
+    const element = document.querySelector(`[data-controller~="${name}"]`);
+    if (!element) {
+      return null;
+    }
+    return stimulus.getControllerForElementAndIdentifier(element, name);
+  }
+
+  /**
+   * Record each level's total number of subjects for the session. The queue
+   * passed to the filter excludes finished items, so (remaining for a level) +
+   * (completed for that level) is its session total. This is recomputed from
+   * scratch on every manipulation rather than kept monotonic, so that if the
+   * session legitimately shrinks (e.g. items dropped during wrap-up, or an
+   * extra_study queue that is smaller), the total follows it down and "to go"
+   * can still reach 0.
+   */
+  function captureSessionLevelTotals() {
+    for (const key of Object.keys(state.currentQueueLevelCounts)) {
+      const level = Number(key);
+      const remaining = state.currentQueueLevelCounts[level] || 0;
+      const completed = state.completedByLevel[level] || 0;
+      state.sessionLevelTotal[level] = remaining + completed;
+    }
+  }
+
+  /**
+   * Attribute a completed subject to its level so the per-level "completed"
+   * count can grow as the session progresses. Prefers the subject's real level
+   * from subjectLevelMap, but falls back to the selected level when that map
+   * has not loaded yet: while a specific level is filtered the queue only holds
+   * items of that level, so an unmapped completion necessarily belongs to it.
+   * Without the fallback, every completion answered before the (async) item
+   * data finished loading would be dropped, permanently under-counting the
+   * level for the rest of the session.
+   * @param {number} subjectId - The completed subject's id
+   */
+  function recordCompletedSubject(subjectId) {
+    let level = state.subjectLevelMap[subjectId];
+    if (!Number.isFinite(level)) {
+      level = getSelectedLevelNumber();
+    }
+    if (!Number.isFinite(level)) {
+      return;
+    }
+    state.completedByLevel[level] = (state.completedByLevel[level] || 0) + 1;
+  }
+
+  /**
+   * Update the progress bar to a given completion percentage, if the
+   * quiz-progress controller is available.
+   * @param {number} percentComplete - Completion percentage (0-100)
+   */
+  function updateQuizProgressBar(percentComplete) {
+    try {
+      const controller = getStimulusController('quiz-progress');
+      if (controller && typeof controller.updateProgress === 'function') {
+        controller.updateProgress({ detail: { percentComplete } });
+      }
+    } catch (error) {
+      // Ignore - the progress bar is non-essential and its internals may change
+    }
+  }
+
+  /**
+   * Re-assert the quiz statistics for the selected level. Rewrites the
+   * "completed" and "to go" counts and the progress bar so they describe the
+   * filtered level rather than the whole session. No-op when no specific level
+   * is selected (the native counts are already correct for "All Levels") or
+   * when the statistics elements are not present.
+   */
+  function syncQuizStatistics() {
+    const levelNum = getSelectedLevelNumber();
+    if (levelNum === null) {
+      return;
+    }
+
+    const total = state.sessionLevelTotal[levelNum];
+    if (!Number.isFinite(total)) {
+      return; // Haven't observed this level in the queue yet
+    }
+
+    const completeTarget = document.querySelector('[data-quiz-statistics-target="completeCount"]');
+    const remainingTarget = document.querySelector('[data-quiz-statistics-target="remainingCount"]');
+    if (!completeTarget || !remainingTarget) {
+      return;
+    }
+
+    const complete = state.completedByLevel[levelNum] || 0;
+    const remaining = Math.max(0, total - complete);
+
+    completeTarget.textContent = String(complete);
+    remainingTarget.textContent = String(remaining);
+
+    const percentComplete = total > 0 ? Math.round((100 * complete) / total) : 100;
+    updateQuizProgressBar(percentComplete);
+  }
+
+  /**
+   * Defer a statistics sync to the next tick so it runs after WaniKani's own
+   * (native) handlers have updated the counts for the same event.
+   */
+  function scheduleQuizStatisticsSync() {
+    setTimeout(syncQuizStatistics, 0);
+  }
+
+  /**
+   * Register the quiz lifecycle listeners that keep the per-level statistics in
+   * sync. Registered once, early; recordCompletedSubject's selected-level
+   * fallback means completions still count even if one fires before the item
+   * data finishes loading.
+   */
+  function setupQuizStatisticsTracking() {
+    if (state.statsListenersRegistered) {
+      return;
+    }
+    state.statsListenersRegistered = true;
+
+    // A subject is fully answered: attribute it to its level, then re-sync.
+    window.addEventListener('didCompleteSubject', (event) => {
+      const subject = event.detail
+        && event.detail.subjectWithStats
+        && event.detail.subjectWithStats.subject;
+      if (subject) {
+        recordCompletedSubject(subject.id);
+      }
+      scheduleQuizStatisticsSync();
+    });
+
+    // A new question is shown (including right after a queue manipulation or
+    // level switch): re-assert the counts the native code may have recomputed.
+    window.addEventListener('willShowNextQuestion', scheduleQuizStatisticsSync);
+  }
+
+  // ============================================
   // SECTION 11: INITIALIZATION
   // ============================================
 
@@ -1132,6 +1324,11 @@
 
     // Reset dropdown reference
     state.dropdown = null;
+
+    // Drop the session's statistics tracking so it can't leak into the next
+    // review session (the window listeners outlive a single session).
+    state.completedByLevel = {};
+    state.sessionLevelTotal = {};
   }
 
   // ============================================
