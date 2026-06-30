@@ -656,8 +656,8 @@
 
     // The queue handed to us excludes already-finished items, so for each level
     // (remaining items) + (items completed so far) is that level's session
-    // total. Record it (monotonically) so the statistics can derive the
-    // "completed"/"to go" split for whichever level is selected.
+    // total. Record it so the statistics can derive the "completed"/"to go"
+    // split for whichever level is selected.
     captureSessionLevelTotals();
 
     // Ensure UI exists and update dropdown to reflect current queue state
@@ -789,6 +789,17 @@
     }
 
     return normalized;
+  }
+
+  /**
+   * Get the selected level as a number, or null when "All Levels" is selected.
+   * getSelectedLevel() (via normalizeSelectedLevel) always yields 'all' or a
+   * positive-integer string, so the parse here never produces NaN.
+   * @returns {number|null} The selected level number, or null for "all"
+   */
+  function getSelectedLevelNumber() {
+    const selectedLevel = getSelectedLevel();
+    return selectedLevel === 'all' ? null : Number.parseInt(selectedLevel, 10);
   }
 
   /**
@@ -1117,28 +1128,37 @@
   /**
    * Record each level's total number of subjects for the session. The queue
    * passed to the filter excludes finished items, so (remaining for a level) +
-   * (completed for that level) is its session total. Totals are kept
-   * monotonic so a transient under-count (e.g. an event missed before our
-   * data finished loading) can never shrink a level's total.
+   * (completed for that level) is its session total. This is recomputed from
+   * scratch on every manipulation rather than kept monotonic, so that if the
+   * session legitimately shrinks (e.g. items dropped during wrap-up, or an
+   * extra_study queue that is smaller), the total follows it down and "to go"
+   * can still reach 0.
    */
   function captureSessionLevelTotals() {
     for (const key of Object.keys(state.currentQueueLevelCounts)) {
       const level = Number(key);
       const remaining = state.currentQueueLevelCounts[level] || 0;
       const completed = state.completedByLevel[level] || 0;
-      const total = remaining + completed;
-      const previous = state.sessionLevelTotal[level];
-      state.sessionLevelTotal[level] = previous == null ? total : Math.max(previous, total);
+      state.sessionLevelTotal[level] = remaining + completed;
     }
   }
 
   /**
    * Attribute a completed subject to its level so the per-level "completed"
-   * count can grow as the session progresses.
+   * count can grow as the session progresses. Prefers the subject's real level
+   * from subjectLevelMap, but falls back to the selected level when that map
+   * has not loaded yet: while a specific level is filtered the queue only holds
+   * items of that level, so an unmapped completion necessarily belongs to it.
+   * Without the fallback, every completion answered before the (async) item
+   * data finished loading would be dropped, permanently under-counting the
+   * level for the rest of the session.
    * @param {number} subjectId - The completed subject's id
    */
   function recordCompletedSubject(subjectId) {
-    const level = state.subjectLevelMap[subjectId];
+    let level = state.subjectLevelMap[subjectId];
+    if (!Number.isFinite(level)) {
+      level = getSelectedLevelNumber();
+    }
     if (!Number.isFinite(level)) {
       return;
     }
@@ -1169,13 +1189,8 @@
    * when the statistics elements are not present.
    */
   function syncQuizStatistics() {
-    const selectedLevel = getSelectedLevel();
-    if (!selectedLevel || selectedLevel === 'all') {
-      return;
-    }
-
-    const levelNum = Number.parseInt(selectedLevel, 10);
-    if (!Number.isFinite(levelNum)) {
+    const levelNum = getSelectedLevelNumber();
+    if (levelNum === null) {
       return;
     }
 
@@ -1210,8 +1225,9 @@
 
   /**
    * Register the quiz lifecycle listeners that keep the per-level statistics in
-   * sync. Registered once, early, so completions are attributed even before the
-   * item data finishes loading.
+   * sync. Registered once, early; recordCompletedSubject's selected-level
+   * fallback means completions still count even if one fires before the item
+   * data finishes loading.
    */
   function setupQuizStatisticsTracking() {
     if (state.statsListenersRegistered) {
@@ -1308,6 +1324,11 @@
 
     // Reset dropdown reference
     state.dropdown = null;
+
+    // Drop the session's statistics tracking so it can't leak into the next
+    // review session (the window listeners outlive a single session).
+    state.completedByLevel = {};
+    state.sessionLevelTotal = {};
   }
 
   // ============================================
