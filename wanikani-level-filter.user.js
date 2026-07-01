@@ -171,10 +171,13 @@
     // Track levels with items in current queue (updated on each filter call)
     currentQueueLevels: new Set(),
     currentQueueLevelCounts: {},
-    // Quiz-statistics tracking (see SECTION 10.5). completedByLevel counts the
-    // subjects fully answered this session, keyed by level; sessionLevelTotal
-    // records each level's total for the session (completed + remaining) so the
-    // "completed"/"to go" counts can be recomputed for the selected level.
+    // Quiz-statistics tracking (see SECTION 10.5). completedTotal counts every
+    // subject fully answered this session, across all levels, so the "completed"
+    // counter stays a session-wide total. completedByLevel counts those same
+    // subjects keyed by level, and sessionLevelTotal records each level's total
+    // for the session (completed + remaining); together they drive the per-level
+    // "to go" count and the progress bar for the selected level.
+    completedTotal: 0,
     completedByLevel: {},
     sessionLevelTotal: {},
     statsListenersRegistered: false,
@@ -228,6 +231,7 @@
     state.availableLevels = [];
     state.levelCounts = {};
     // Start the session's statistics tracking from a clean slate
+    state.completedTotal = 0;
     state.completedByLevel = {};
     state.sessionLevelTotal = {};
 
@@ -1103,9 +1107,10 @@
   // auto-switch levels the native code derives the counts from mismatched
   // numbers (a session-wide "completed" against a per-level total), so both
   // counts and the progress bar drift. To keep them correct we own the
-  // statistics while a specific level is selected: we count completed subjects
-  // per level ourselves and re-assert completed / to go / progress for the
-  // selected level on every relevant quiz event.
+  // statistics while a specific level is selected and re-assert them on every
+  // relevant quiz event: "completed" stays a session-wide total of every item
+  // finished (across all levels), while "to go" and the progress bar describe
+  // just the selected level, using our own per-level completion counts.
 
   /**
    * Resolve a Stimulus controller instance by identifier, or null if Stimulus
@@ -1144,8 +1149,10 @@
   }
 
   /**
-   * Attribute a completed subject to its level so the per-level "completed"
-   * count can grow as the session progresses. Prefers the subject's real level
+   * Record a completed subject. Always bumps the session-wide completedTotal so
+   * the "completed" counter reflects every item finished this session, across
+   * all levels. Then attributes the subject to its level so the per-level "to
+   * go" count and progress bar can advance. Prefers the subject's real level
    * from subjectLevelMap, but falls back to the selected level when that map
    * has not loaded yet: while a specific level is filtered the queue only holds
    * items of that level, so an unmapped completion necessarily belongs to it.
@@ -1155,6 +1162,8 @@
    * @param {number} subjectId - The completed subject's id
    */
   function recordCompletedSubject(subjectId) {
+    state.completedTotal += 1;
+
     let level = state.subjectLevelMap[subjectId];
     if (!Number.isFinite(level)) {
       level = getSelectedLevelNumber();
@@ -1182,11 +1191,12 @@
   }
 
   /**
-   * Re-assert the quiz statistics for the selected level. Rewrites the
-   * "completed" and "to go" counts and the progress bar so they describe the
-   * filtered level rather than the whole session. No-op when no specific level
-   * is selected (the native counts are already correct for "All Levels") or
-   * when the statistics elements are not present.
+   * Re-assert the quiz statistics while a specific level is filtered. Rewrites
+   * the "completed" count to the session-wide total (every item finished across
+   * all levels) and the "to go" count plus progress bar to describe the selected
+   * level. No-op when no specific level is selected (the native counts are
+   * already correct for "All Levels") or when the statistics elements are not
+   * present.
    */
   function syncQuizStatistics() {
     const levelNum = getSelectedLevelNumber();
@@ -1205,13 +1215,15 @@
       return;
     }
 
-    const complete = state.completedByLevel[levelNum] || 0;
-    const remaining = Math.max(0, total - complete);
+    const levelComplete = state.completedByLevel[levelNum] || 0;
+    const remaining = Math.max(0, total - levelComplete);
 
-    completeTarget.textContent = String(complete);
+    // "Completed" stays a session-wide total (every item finished across all
+    // levels); "to go" and the progress bar describe just the selected level.
+    completeTarget.textContent = String(state.completedTotal);
     remainingTarget.textContent = String(remaining);
 
-    const percentComplete = total > 0 ? Math.round((100 * complete) / total) : 100;
+    const percentComplete = total > 0 ? Math.round((100 * levelComplete) / total) : 100;
     updateQuizProgressBar(percentComplete);
   }
 
@@ -1327,6 +1339,7 @@
 
     // Drop the session's statistics tracking so it can't leak into the next
     // review session (the window listeners outlive a single session).
+    state.completedTotal = 0;
     state.completedByLevel = {};
     state.sessionLevelTotal = {};
   }
