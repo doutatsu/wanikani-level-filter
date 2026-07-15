@@ -2,7 +2,7 @@
 // @name         WaniKani Level Filter
 // @namespace    wanikani-level-filter
 // @description  Filter reviews by level during active review sessions
-// @version      1.3.0
+// @version      1.3.1
 // @author       doutatsu
 // @match        https://www.wanikani.com/*
 // @match        https://preview.wanikani.com/*
@@ -88,12 +88,6 @@
       top: 50px;
       left: 10px;
       z-index: 1000;
-    `,
-    containerFixed: `
-      position: fixed;
-      top: 50px;
-      left: 10px;
-      z-index: 10000;
     `,
     label: `
       color: white;
@@ -558,22 +552,19 @@
       if (homeButton || header) {
         clearInterval(waitForHeader);
 
+        // Anchor to the document body (not the sticky header) so the menu
+        // stays at its starting position and scrolls away with the page
+        // instead of floating with the header as you scroll down.
         const container = createDropdownContainer(dropdown, STYLES.containerAbsolute);
-
-        // Insert into the header or body
-        if (header) {
-          header.style.position = 'relative'; // Ensure header is positioned
-          header.appendChild(container);
-        } else {
-          document.body.appendChild(container);
-        }
+        document.body.appendChild(container);
 
       } else if (attempts >= maxAttempts) {
         clearInterval(waitForHeader);
 
-        // Fallback: insert at top-left corner
+        // Fallback: insert at top-left corner, anchored to the document so it
+        // scrolls with the page rather than floating.
         if (document.body) {
-          const container = createDropdownContainer(dropdown, STYLES.containerFixed);
+          const container = createDropdownContainer(dropdown, STYLES.containerAbsolute);
           document.body.appendChild(container);
         }
       }
