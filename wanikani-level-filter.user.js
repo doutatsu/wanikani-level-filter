@@ -2,7 +2,7 @@
 // @name         WaniKani Level Filter
 // @namespace    wanikani-level-filter
 // @description  Filter reviews by level during active review sessions
-// @version      1.3.1
+// @version      1.3.2
 // @author       doutatsu
 // @match        https://www.wanikani.com/*
 // @match        https://preview.wanikani.com/*
@@ -534,6 +534,58 @@
   }
 
   /**
+   * Find the nearest scrollable ancestor of an element — the container whose
+   * own scrolling actually moves the page content.
+   *
+   * On WaniKani's review page the window/document does NOT scroll; an inner
+   * element does. That means an absolutely-positioned menu anchored to <body>
+   * is positioned against the (viewport-sized) initial containing block and
+   * appears to float, staying pinned on screen as you scroll. Anchoring it
+   * inside the real scroll container instead lets it scroll away with the
+   * content, since absolutely-positioned descendants of a scroll container
+   * participate in that container's scrollable overflow.
+   *
+   * @param {HTMLElement} start - Element to search upward from
+   * @returns {HTMLElement|null} The scroll container, or null if none found
+   */
+  function findScrollContainer(start) {
+    let node = start || null;
+    while (node && node !== document.body && node !== document.documentElement) {
+      const overflowY = window.getComputedStyle(node).overflowY;
+      if (overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay') {
+        return node;
+      }
+      node = node.parentElement;
+    }
+    return null;
+  }
+
+  /**
+   * Anchor the menu container to the page so it scrolls away with the content
+   * instead of floating. Prefers the inner scroll container (see
+   * findScrollContainer); falls back to <body> when the window is the scroller.
+   * @param {HTMLDivElement} container - The menu container to place
+   * @param {HTMLElement|null} anchor - A known in-content element to search from
+   */
+  function anchorMenuToScroll(container, anchor) {
+    const scrollContainer = findScrollContainer(anchor) ||
+                            findScrollContainer(document.querySelector('.quiz'));
+
+    if (scrollContainer) {
+      // The container must be a positioned ancestor for the absolutely
+      // positioned menu to be placed relative to it (and scroll with it).
+      if (window.getComputedStyle(scrollContainer).position === 'static') {
+        scrollContainer.style.position = 'relative';
+      }
+      scrollContainer.appendChild(container);
+    } else {
+      // Window is the scroller (or no container found): body-anchored absolute
+      // positioning scrolls with the document just fine.
+      document.body.appendChild(container);
+    }
+  }
+
+  /**
    * Insert the dropdown into the review page header
    * @param {HTMLSelectElement} dropdown - The dropdown to insert
    */
@@ -552,20 +604,20 @@
       if (homeButton || header) {
         clearInterval(waitForHeader);
 
-        // Anchor to the document body (not the sticky header) so the menu
-        // stays at its starting position and scrolls away with the page
-        // instead of floating with the header as you scroll down.
+        // Anchor inside the page's scroll container (not the sticky header) so
+        // the menu stays at its starting position and scrolls away with the
+        // content instead of floating as you scroll down.
         const container = createDropdownContainer(dropdown, STYLES.containerAbsolute);
-        document.body.appendChild(container);
+        anchorMenuToScroll(container, header || homeButton);
 
       } else if (attempts >= maxAttempts) {
         clearInterval(waitForHeader);
 
-        // Fallback: insert at top-left corner, anchored to the document so it
-        // scrolls with the page rather than floating.
+        // Fallback: insert at top-left corner, still anchored to the scroll
+        // container where possible so it scrolls with the page.
         if (document.body) {
           const container = createDropdownContainer(dropdown, STYLES.containerAbsolute);
-          document.body.appendChild(container);
+          anchorMenuToScroll(container, null);
         }
       }
     }, HEADER_CHECK_INTERVAL);
