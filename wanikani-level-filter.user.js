@@ -2,7 +2,7 @@
 // @name         WaniKani Level Filter
 // @namespace    wanikani-level-filter
 // @description  Filter reviews by level during active review sessions
-// @version      1.4.0
+// @version      1.5.0
 // @author       doutatsu
 // @match        https://www.wanikani.com/*
 // @match        https://preview.wanikani.com/*
@@ -45,10 +45,6 @@
   const HEADER_CHECK_INTERVAL = 100; // ms
   const HEADER_TIMEOUT = 5000; // ms
   const EMPTY_QUEUE_CLASS = 'level-filter-empty-queue';
-  // Subtrees that EMPTY_QUEUE_CSS hides, and that Turbo replaces wholesale. The
-  // menu must never be anchored inside one of these: it would vanish exactly
-  // when the "no items - pick another level" message asks the user to use it.
-  const VOLATILE_SUBTREE_SELECTOR = '.quiz, turbo-frame#quiz';
 
   const UI_IDS = {
     container: 'level-filter-container',
@@ -92,6 +88,15 @@
       top: 50px;
       left: 10px;
       z-index: 1000;
+    `,
+    // Used only while the quiz subtree is hidden (empty queue): there is nothing
+    // to scroll then, and the menu has to sit outside that subtree to stay
+    // visible, so pinning it to the viewport is the right behaviour.
+    containerFixed: `
+      position: fixed;
+      top: 50px;
+      left: 10px;
+      z-index: 100001;
     `,
     label: `
       color: white;
@@ -173,16 +178,24 @@
     // level to the Set of subject ids seen in the queue at any point this
     // session, so its size is that level's session total.
     // completedLevelSubjects maps a level to the Set of ids known to be done,
-    // fed from two independent sources: the queue (any previously seen id that
-    // is missing from a fresh queue must be finished) and the didCompleteSubject
-    // event (which keeps the count moving between queue manipulations). Losing
-    // either source costs freshness or self-correction, never both, and neither
-    // can drive a count to a bogus zero.
+    // fed by the queue (any previously seen id missing from a fresh queue must
+    // be finished) and topped up by the didCompleteSubject event.
     sessionLevelSubjects: {},
     completedLevelSubjects: {},
+    // Size of each level's completed set as of the last queue reconciliation,
+    // plus WaniKani's own completed counter at that same moment. The difference
+    // between that counter and its current value is how many subjects have been
+    // finished since - a third signal, used when the others are not moving.
+    reconciledBaseByLevel: {},
+    nativeCompletedAtReconcile: null,
     statsListenersRegistered: false,
     // Scroll container we forced to position:relative, so cleanup can undo it
     patchedScrollContainer: null,
+    // Menu anchoring: whether the empty-queue state has parked the menu on
+    // <body>, and where to put it back afterwards.
+    emptyQueueLayout: false,
+    menuParentBeforeEmptyQueue: null,
+    scrollWatchAttached: false,
     // Track if user intentionally clicked home button
     userClickedHome: false,
     // Avoid registering multiple filters on turbo navigation
@@ -235,6 +248,8 @@
     // Start the session's statistics tracking from a clean slate
     state.sessionLevelSubjects = {};
     state.completedLevelSubjects = {};
+    state.reconciledBaseByLevel = {};
+    state.nativeCompletedAtReconcile = null;
 
     const config = {
       wk_items: {
@@ -437,6 +452,9 @@
     if (document.body) {
       document.body.classList.remove(EMPTY_QUEUE_CLASS);
     }
+    // The quiz subtree is visible again, so the menu can go back to scrolling
+    // with it.
+    exitEmptyQueueLayout();
   }
 
   /**
@@ -552,10 +570,14 @@
    * content, since absolutely-positioned descendants of a scroll container
    * participate in that container's scrollable overflow.
    *
-   * Candidates inside a volatile subtree (see VOLATILE_SUBTREE_SELECTOR) are
-   * skipped, and a candidate that merely *permits* scrolling is only used when
-   * no ancestor is actually scrolling: WaniKani has non-scrolling
-   * `overflow-y: auto` wrappers, and anchoring inside one clips the menu.
+   * A candidate that merely *permits* scrolling is only used when no ancestor is
+   * actually scrolling: WaniKani has non-scrolling `overflow-y: auto` wrappers,
+   * and anchoring inside one clips the menu.
+   *
+   * This is only the opening guess. Which element scrolls depends on styling we
+   * do not control and cannot reliably infer at insertion time (the content may
+   * not have grown yet), so watchForScrollContainer corrects it from the first
+   * real scroll event.
    *
    * @param {HTMLElement} start - Element to search upward from
    * @returns {HTMLElement|null} The scroll container, or null if none found
@@ -565,11 +587,6 @@
     let fallback = null;
 
     while (node && node !== document.body && node !== document.documentElement) {
-      if (node.closest(VOLATILE_SUBTREE_SELECTOR)) {
-        node = node.parentElement;
-        continue;
-      }
-
       const overflowY = window.getComputedStyle(node).overflowY;
       if (overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay') {
         if (node.scrollHeight > node.clientHeight) {
@@ -586,11 +603,58 @@
   }
 
   /**
-   * Anchor the menu container to the page so it scrolls away with the content
-   * instead of floating. Prefers the inner scroll container (see
-   * findScrollContainer), which never resolves inside the quiz subtree the
-   * empty-queue CSS hides; falls back to <body> when the window is the scroller
-   * or when the only scroll container is inside that subtree.
+   * Put the menu inside a given element, making that element a positioning
+   * context first so our absolutely-positioned menu resolves against it (and so
+   * scrolls with its content) rather than against the viewport.
+   * @param {HTMLElement} parent - The element to place the menu in
+   * @param {HTMLDivElement} container - The menu container to place
+   */
+  function placeMenuIn(parent, container) {
+    if (parent !== document.body && window.getComputedStyle(parent).position === 'static') {
+      parent.style.position = 'relative';
+      // Remember the patch so cleanupUI can put WaniKani's DOM back.
+      state.patchedScrollContainer = parent;
+    }
+    container.style.cssText = STYLES.containerBase + STYLES.containerAbsolute;
+    parent.appendChild(container);
+  }
+
+  /**
+   * Correct the menu's anchor using the first scroll event that actually
+   * happens. Reading the DOM can only tell us which element *may* scroll;
+   * a scroll event tells us which one *does*, whatever WaniKani's layout is
+   * doing. The listener is capturing because scroll events on elements do not
+   * bubble, and it stays attached so a later layout change (a Turbo render
+   * swapping the quiz subtree) is picked up too.
+   * @param {HTMLDivElement} container - The menu container to keep anchored
+   */
+  function watchForScrollContainer(container) {
+    if (state.scrollWatchAttached) {
+      return;
+    }
+    state.scrollWatchAttached = true;
+
+    document.addEventListener('scroll', (event) => {
+      const target = event.target;
+      // The document/window scrolling means body-anchored positioning is
+      // already correct - an absolute menu on <body> scrolls with the page.
+      if (!target || target === document || target === document.documentElement ||
+          target === document.body || target.nodeType !== 1) {
+        return;
+      }
+      // Already anchored correctly, or the menu is not in the DOM right now
+      // (empty-queue state parks it on <body> on purpose).
+      if (target === container.parentElement || state.emptyQueueLayout) {
+        return;
+      }
+      placeMenuIn(target, container);
+    }, true);
+  }
+
+  /**
+   * Anchor the menu so it scrolls away with the content instead of floating.
+   * Starts from a best guess (see findScrollContainer) and then lets the first
+   * scroll event correct it.
    * @param {HTMLDivElement} container - The menu container to place
    * @param {HTMLElement|null} anchor - A known in-content element to search from
    */
@@ -598,20 +662,46 @@
     const scrollContainer = findScrollContainer(anchor) ||
                             findScrollContainer(document.querySelector('.quiz'));
 
-    if (scrollContainer) {
-      // The container must be a positioned ancestor for the absolutely
-      // positioned menu to be placed relative to it (and scroll with it).
-      // Remember the patch so cleanupUI can put WaniKani's DOM back.
-      if (window.getComputedStyle(scrollContainer).position === 'static') {
-        scrollContainer.style.position = 'relative';
-        state.patchedScrollContainer = scrollContainer;
-      }
-      scrollContainer.appendChild(container);
-    } else {
-      // Window is the scroller (or no container found): body-anchored absolute
-      // positioning scrolls with the document just fine.
-      document.body.appendChild(container);
+    placeMenuIn(scrollContainer || document.body, container);
+    watchForScrollContainer(container);
+  }
+
+  /**
+   * Park the menu on <body>, pinned to the viewport, while the quiz subtree is
+   * hidden. The real scroll container is inside that subtree, so leaving the
+   * menu there would hide it at exactly the moment the "no items - pick another
+   * level" message asks the user to use it. Nothing scrolls in this state, so
+   * fixed positioning is right.
+   */
+  function enterEmptyQueueLayout() {
+    const container = document.getElementById(UI_IDS.container);
+    if (!container || state.emptyQueueLayout) {
+      return;
     }
+    state.emptyQueueLayout = true;
+    state.menuParentBeforeEmptyQueue = container.parentElement;
+    container.style.cssText = STYLES.containerBase + STYLES.containerFixed;
+    document.body.appendChild(container);
+  }
+
+  /**
+   * Put the menu back where it was before the empty-queue state parked it, so it
+   * resumes scrolling with the content.
+   */
+  function exitEmptyQueueLayout() {
+    if (!state.emptyQueueLayout) {
+      return;
+    }
+    state.emptyQueueLayout = false;
+
+    const container = document.getElementById(UI_IDS.container);
+    const parent = state.menuParentBeforeEmptyQueue;
+    state.menuParentBeforeEmptyQueue = null;
+    if (!container) {
+      return;
+    }
+    // The old parent may have been swapped out by Turbo while we were away.
+    placeMenuIn(parent && parent.isConnected ? parent : document.body, container);
   }
 
   /**
@@ -738,8 +828,12 @@
     }
     reconcileCompletedSubjects(idsStillQueued);
 
-    // Ensure UI exists and update dropdown to reflect current queue state
-    if (!state.dropdown) {
+    // Ensure UI exists and update dropdown to reflect current queue state. The
+    // menu now lives inside the quiz subtree, which Turbo can replace wholesale
+    // and take the menu with it, so rebuild whenever it has left the document
+    // rather than trusting the state reference to still be attached.
+    if (!state.dropdown || !document.getElementById(UI_IDS.container)) {
+      state.dropdown = null;
       setupUI();
     }
     updateDropdownOptions();
@@ -785,7 +879,9 @@
         return newLevelQueue;
       }
 
-      // No levels have items at all - show message
+      // No levels have items at all - show message. Move the menu out of the
+      // quiz subtree first, since the class about to be added hides it.
+      enterEmptyQueueLayout();
       document.body.classList.add(EMPTY_QUEUE_CLASS);
       showNoItemsMessage();
       return queue; // Return original queue to prevent redirect
@@ -1184,20 +1280,25 @@
   // we want.
   //
   // A level's session total comes from the queue: every subject id we have ever
-  // seen at that level. How many of them are done comes from two independent
-  // sources, because neither alone is sufficient:
+  // seen at that level. How many of them are done comes from three signals,
+  // because each one alone has been observed to stall:
   //   - The queue reconciles: on every manipulation, any previously seen id that
-  //     is no longer in the queue must be finished. This is authoritative and
+  //     is no longer in the queue must be finished. Authoritative and
   //     self-correcting, but manipulations are infrequent (a refresh, a level
-  //     switch, a skip) -- not one per answered item.
-  //   - `didCompleteSubject` keeps the count moving in between manipulations, so
-  //     "to go" ticks down as the user answers instead of freezing.
-  // An earlier version used only the event; when it stopped delivering, the
-  // counters stuck at zero and we wrote that zero over WaniKani's correct
-  // "completed" for the whole session. Hence: `completeCount` is never written
-  // (WaniKani's own value is already the session-wide total we want), and the
-  // event can only ever add to a queue-reconciled set, so losing it degrades
-  // freshness rather than zeroing anything.
+  //     switch, a skip) -- not one per answered item, so "to go" froze.
+  //   - `didCompleteSubject`, which used to tick the count between
+  //     manipulations. WaniKani no longer appears to deliver it (their event
+  //     modules list `did_answer_question` and `will_show_next_question`, but no
+  //     `did_complete_subject`), so it is kept only as a bonus.
+  //   - WaniKani's own "completed" counter, which we never write and which does
+  //     keep moving. Its increase since the last reconciliation is how many
+  //     subjects of the selected level are newly done, because a filtered queue
+  //     holds only that level's items.
+  // The lesson from two stuck-counter bugs is not to trust any single source:
+  // `completeCount` is never written (WaniKani's own value is already the
+  // session-wide total we want), and every signal can only move "done" forward
+  // from the last queue-derived baseline, so one going quiet costs freshness
+  // rather than pinning a count.
 
   /**
    * Resolve a Stimulus controller instance by identifier, or null if Stimulus
@@ -1266,7 +1367,43 @@
         }
       }
       state.completedLevelSubjects[key] = completed;
+      state.reconciledBaseByLevel[key] = completed.size;
     }
+    // Baseline for the native-counter signal: from here until the next
+    // reconciliation, every subject WaniKani counts as finished is one more
+    // subject of the selected level done (a filtered queue holds only that
+    // level's items).
+    state.nativeCompletedAtReconcile = readNativeCompletedCount();
+  }
+
+  /**
+   * Read WaniKani's own "completed" counter. We never write this element, so it
+   * is an independent, always-moving signal - unlike the quiz lifecycle events,
+   * which WaniKani renames, and unlike queue manipulations, which are
+   * infrequent.
+   * @returns {number|null} The count, or null if unavailable/unparseable
+   */
+  function readNativeCompletedCount() {
+    const target = document.querySelector('[data-quiz-statistics-target="completeCount"]');
+    if (!target) {
+      return null;
+    }
+    const value = Number.parseInt(target.textContent, 10);
+    return Number.isFinite(value) ? value : null;
+  }
+
+  /**
+   * How many subjects have been finished since the last queue reconciliation,
+   * according to WaniKani's own counter. Zero when the counter is unreadable or
+   * has gone backwards (it resets between sessions).
+   * @returns {number} Subjects completed since the last reconciliation
+   */
+  function completedSinceReconcile() {
+    const now = readNativeCompletedCount();
+    if (now === null || state.nativeCompletedAtReconcile === null) {
+      return 0;
+    }
+    return Math.max(0, now - state.nativeCompletedAtReconcile);
   }
 
   /**
@@ -1384,12 +1521,18 @@
       return;
     }
 
-    // The level's session total minus what we know is finished. The completed
-    // set is queue-reconciled and event-topped-up, so it tracks answers as they
-    // happen without depending on any single source (see the section header).
+    // The level's session total minus what we know is finished. Two signals
+    // report that, and we take whichever has got further: the completed set
+    // (queue-reconciled, topped up by didCompleteSubject) and the count of
+    // subjects WaniKani has marked done since that reconciliation. They are
+    // measured from the same baseline, so this is a choice between them rather
+    // than a sum - no double counting if both happen to be working.
     const total = sessionSubjects.size;
     const completedSubjects = state.completedLevelSubjects[levelNum];
-    const levelComplete = Math.min(total, completedSubjects ? completedSubjects.size : 0);
+    const fromSet = completedSubjects ? completedSubjects.size : 0;
+    const fromNativeCounter = (state.reconciledBaseByLevel[levelNum] || 0) + completedSinceReconcile();
+
+    const levelComplete = Math.min(total, Math.max(fromSet, fromNativeCounter));
     const remaining = total - levelComplete;
 
     remainingTarget.textContent = String(remaining);
@@ -1524,6 +1667,8 @@
     // review session (the window listeners outlive a single session).
     state.sessionLevelSubjects = {};
     state.completedLevelSubjects = {};
+    state.reconciledBaseByLevel = {};
+    state.nativeCompletedAtReconcile = null;
   }
 
   // ============================================
