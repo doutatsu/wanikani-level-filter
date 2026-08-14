@@ -2,7 +2,7 @@
 // @name         WaniKani Level Filter
 // @namespace    wanikani-level-filter
 // @description  Filter reviews by level during active review sessions
-// @version      1.3.0
+// @version      1.5.0
 // @author       doutatsu
 // @match        https://www.wanikani.com/*
 // @match        https://preview.wanikani.com/*
@@ -89,11 +89,14 @@
       left: 10px;
       z-index: 1000;
     `,
+    // Used only while the quiz subtree is hidden (empty queue): there is nothing
+    // to scroll then, and the menu has to sit outside that subtree to stay
+    // visible, so pinning it to the viewport is the right behaviour.
     containerFixed: `
       position: fixed;
       top: 50px;
       left: 10px;
-      z-index: 10000;
+      z-index: 100001;
     `,
     label: `
       color: white;
@@ -171,16 +174,28 @@
     // Track levels with items in current queue (updated on each filter call)
     currentQueueLevels: new Set(),
     currentQueueLevelCounts: {},
-    // Quiz-statistics tracking (see SECTION 10.5). completedTotal counts every
-    // subject fully answered this session, across all levels, so the "completed"
-    // counter stays a session-wide total. completedByLevel counts those same
-    // subjects keyed by level, and sessionLevelTotal records each level's total
-    // for the session (completed + remaining); together they drive the per-level
-    // "to go" count and the progress bar for the selected level.
-    completedTotal: 0,
-    completedByLevel: {},
-    sessionLevelTotal: {},
+    // Quiz-statistics tracking (see SECTION 10.5). sessionLevelSubjects maps a
+    // level to the Set of subject ids seen in the queue at any point this
+    // session, so its size is that level's session total.
+    // completedLevelSubjects maps a level to the Set of ids known to be done,
+    // fed by the queue (any previously seen id missing from a fresh queue must
+    // be finished) and topped up by the didCompleteSubject event.
+    sessionLevelSubjects: {},
+    completedLevelSubjects: {},
+    // Size of each level's completed set as of the last queue reconciliation,
+    // plus WaniKani's own completed counter at that same moment. The difference
+    // between that counter and its current value is how many subjects have been
+    // finished since - a third signal, used when the others are not moving.
+    reconciledBaseByLevel: {},
+    nativeCompletedAtReconcile: null,
     statsListenersRegistered: false,
+    // Scroll container we forced to position:relative, so cleanup can undo it
+    patchedScrollContainer: null,
+    // Menu anchoring: whether the empty-queue state has parked the menu on
+    // <body>, and where to put it back afterwards.
+    emptyQueueLayout: false,
+    menuParentBeforeEmptyQueue: null,
+    scrollWatchAttached: false,
     // Track if user intentionally clicked home button
     userClickedHome: false,
     // Avoid registering multiple filters on turbo navigation
@@ -231,9 +246,10 @@
     state.availableLevels = [];
     state.levelCounts = {};
     // Start the session's statistics tracking from a clean slate
-    state.completedTotal = 0;
-    state.completedByLevel = {};
-    state.sessionLevelTotal = {};
+    state.sessionLevelSubjects = {};
+    state.completedLevelSubjects = {};
+    state.reconciledBaseByLevel = {};
+    state.nativeCompletedAtReconcile = null;
 
     const config = {
       wk_items: {
@@ -436,6 +452,9 @@
     if (document.body) {
       document.body.classList.remove(EMPTY_QUEUE_CLASS);
     }
+    // The quiz subtree is visible again, so the menu can go back to scrolling
+    // with it.
+    exitEmptyQueueLayout();
   }
 
   /**
@@ -540,6 +559,152 @@
   }
 
   /**
+   * Find the nearest scrollable ancestor of an element — the container whose
+   * own scrolling actually moves the page content.
+   *
+   * On WaniKani's review page the window/document does NOT scroll; an inner
+   * element does. That means an absolutely-positioned menu anchored to <body>
+   * is positioned against the (viewport-sized) initial containing block and
+   * appears to float, staying pinned on screen as you scroll. Anchoring it
+   * inside the real scroll container instead lets it scroll away with the
+   * content, since absolutely-positioned descendants of a scroll container
+   * participate in that container's scrollable overflow.
+   *
+   * A candidate that merely *permits* scrolling is only used when no ancestor is
+   * actually scrolling: WaniKani has non-scrolling `overflow-y: auto` wrappers,
+   * and anchoring inside one clips the menu.
+   *
+   * This is only the opening guess. Which element scrolls depends on styling we
+   * do not control and cannot reliably infer at insertion time (the content may
+   * not have grown yet), so watchForScrollContainer corrects it from the first
+   * real scroll event.
+   *
+   * @param {HTMLElement} start - Element to search upward from
+   * @returns {HTMLElement|null} The scroll container, or null if none found
+   */
+  function findScrollContainer(start) {
+    let node = start || null;
+    let fallback = null;
+
+    while (node && node !== document.body && node !== document.documentElement) {
+      const overflowY = window.getComputedStyle(node).overflowY;
+      if (overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay') {
+        if (node.scrollHeight > node.clientHeight) {
+          return node; // Actually scrolling right now - this is the real one
+        }
+        if (!fallback) {
+          fallback = node;
+        }
+      }
+      node = node.parentElement;
+    }
+
+    return fallback;
+  }
+
+  /**
+   * Put the menu inside a given element, making that element a positioning
+   * context first so our absolutely-positioned menu resolves against it (and so
+   * scrolls with its content) rather than against the viewport.
+   * @param {HTMLElement} parent - The element to place the menu in
+   * @param {HTMLDivElement} container - The menu container to place
+   */
+  function placeMenuIn(parent, container) {
+    if (parent !== document.body && window.getComputedStyle(parent).position === 'static') {
+      parent.style.position = 'relative';
+      // Remember the patch so cleanupUI can put WaniKani's DOM back.
+      state.patchedScrollContainer = parent;
+    }
+    container.style.cssText = STYLES.containerBase + STYLES.containerAbsolute;
+    parent.appendChild(container);
+  }
+
+  /**
+   * Correct the menu's anchor using the first scroll event that actually
+   * happens. Reading the DOM can only tell us which element *may* scroll;
+   * a scroll event tells us which one *does*, whatever WaniKani's layout is
+   * doing. The listener is capturing because scroll events on elements do not
+   * bubble, and it stays attached so a later layout change (a Turbo render
+   * swapping the quiz subtree) is picked up too.
+   * @param {HTMLDivElement} container - The menu container to keep anchored
+   */
+  function watchForScrollContainer(container) {
+    if (state.scrollWatchAttached) {
+      return;
+    }
+    state.scrollWatchAttached = true;
+
+    document.addEventListener('scroll', (event) => {
+      const target = event.target;
+      // The document/window scrolling means body-anchored positioning is
+      // already correct - an absolute menu on <body> scrolls with the page.
+      if (!target || target === document || target === document.documentElement ||
+          target === document.body || target.nodeType !== 1) {
+        return;
+      }
+      // Already anchored correctly, or the menu is not in the DOM right now
+      // (empty-queue state parks it on <body> on purpose).
+      if (target === container.parentElement || state.emptyQueueLayout) {
+        return;
+      }
+      placeMenuIn(target, container);
+    }, true);
+  }
+
+  /**
+   * Anchor the menu so it scrolls away with the content instead of floating.
+   * Starts from a best guess (see findScrollContainer) and then lets the first
+   * scroll event correct it.
+   * @param {HTMLDivElement} container - The menu container to place
+   * @param {HTMLElement|null} anchor - A known in-content element to search from
+   */
+  function anchorMenuToScroll(container, anchor) {
+    const scrollContainer = findScrollContainer(anchor) ||
+                            findScrollContainer(document.querySelector('.quiz'));
+
+    placeMenuIn(scrollContainer || document.body, container);
+    watchForScrollContainer(container);
+  }
+
+  /**
+   * Park the menu on <body>, pinned to the viewport, while the quiz subtree is
+   * hidden. The real scroll container is inside that subtree, so leaving the
+   * menu there would hide it at exactly the moment the "no items - pick another
+   * level" message asks the user to use it. Nothing scrolls in this state, so
+   * fixed positioning is right.
+   */
+  function enterEmptyQueueLayout() {
+    const container = document.getElementById(UI_IDS.container);
+    if (!container || state.emptyQueueLayout) {
+      return;
+    }
+    state.emptyQueueLayout = true;
+    state.menuParentBeforeEmptyQueue = container.parentElement;
+    container.style.cssText = STYLES.containerBase + STYLES.containerFixed;
+    document.body.appendChild(container);
+  }
+
+  /**
+   * Put the menu back where it was before the empty-queue state parked it, so it
+   * resumes scrolling with the content.
+   */
+  function exitEmptyQueueLayout() {
+    if (!state.emptyQueueLayout) {
+      return;
+    }
+    state.emptyQueueLayout = false;
+
+    const container = document.getElementById(UI_IDS.container);
+    const parent = state.menuParentBeforeEmptyQueue;
+    state.menuParentBeforeEmptyQueue = null;
+    if (!container) {
+      return;
+    }
+    // The old parent may have been swapped out by Turbo while we were away.
+    placeMenuIn(parent && parent.isConnected ? parent : document.body, container);
+  }
+
+  /**
    * Insert the dropdown into the review page header
    * @param {HTMLSelectElement} dropdown - The dropdown to insert
    */
@@ -558,23 +723,20 @@
       if (homeButton || header) {
         clearInterval(waitForHeader);
 
+        // Anchor inside the page's scroll container (not the sticky header) so
+        // the menu stays at its starting position and scrolls away with the
+        // content instead of floating as you scroll down.
         const container = createDropdownContainer(dropdown, STYLES.containerAbsolute);
-
-        // Insert into the header or body
-        if (header) {
-          header.style.position = 'relative'; // Ensure header is positioned
-          header.appendChild(container);
-        } else {
-          document.body.appendChild(container);
-        }
+        anchorMenuToScroll(container, header || homeButton);
 
       } else if (attempts >= maxAttempts) {
         clearInterval(waitForHeader);
 
-        // Fallback: insert at top-left corner
+        // Fallback: insert at top-left corner, still anchored to the scroll
+        // container where possible so it scrolls with the page.
         if (document.body) {
-          const container = createDropdownContainer(dropdown, STYLES.containerFixed);
-          document.body.appendChild(container);
+          const container = createDropdownContainer(dropdown, STYLES.containerAbsolute);
+          anchorMenuToScroll(container, null);
         }
       }
     }, HEADER_CHECK_INTERVAL);
@@ -647,25 +809,31 @@
     // Remove empty queue styling first
     clearEmptyQueueUI();
 
-    // Track what levels are available in the current queue
+    // Track what levels are available in the current queue, and remember every
+    // subject we have ever seen so the statistics can work out each level's
+    // session total (see SECTION 10.5).
     state.currentQueueLevels.clear();
     state.currentQueueLevelCounts = {};
+    const idsStillQueued = new Set();
     for (const queueItem of queue) {
       const itemLevel = getQueueItemLevel(queueItem);
       if (itemLevel !== null) {
         state.currentQueueLevels.add(itemLevel);
         state.currentQueueLevelCounts[itemLevel] = (state.currentQueueLevelCounts[itemLevel] || 0) + 1;
+        const subjectId = recordSessionSubject(itemLevel, queueItem);
+        if (subjectId !== null) {
+          idsStillQueued.add(subjectId);
+        }
       }
     }
+    reconcileCompletedSubjects(idsStillQueued);
 
-    // The queue handed to us excludes already-finished items, so for each level
-    // (remaining items) + (items completed so far) is that level's session
-    // total. Record it so the statistics can derive the "completed"/"to go"
-    // split for whichever level is selected.
-    captureSessionLevelTotals();
-
-    // Ensure UI exists and update dropdown to reflect current queue state
-    if (!state.dropdown) {
+    // Ensure UI exists and update dropdown to reflect current queue state. The
+    // menu now lives inside the quiz subtree, which Turbo can replace wholesale
+    // and take the menu with it, so rebuild whenever it has left the document
+    // rather than trusting the state reference to still be attached.
+    if (!state.dropdown || !document.getElementById(UI_IDS.container)) {
+      state.dropdown = null;
       setupUI();
     }
     updateDropdownOptions();
@@ -711,7 +879,9 @@
         return newLevelQueue;
       }
 
-      // No levels have items at all - show message
+      // No levels have items at all - show message. Move the menu out of the
+      // quiz subtree first, since the class about to be added hides it.
+      enterEmptyQueueLayout();
       document.body.classList.add(EMPTY_QUEUE_CLASS);
       showNoItemsMessage();
       return queue; // Return original queue to prevent redirect
@@ -1102,15 +1272,33 @@
   //   - `quiz-progress` draws the progress bar via updateProgress({ detail:
   //     { percentComplete } }).
   // When the queue is filtered, the Queue Manipulator rewrites the queue and
-  // the `remainingCount` target, but it never touches `completeCount`, and it
-  // resets the quiz's internal item total to the *filtered* length. Once we
-  // auto-switch levels the native code derives the counts from mismatched
-  // numbers (a session-wide "completed" against a per-level total), so both
-  // counts and the progress bar drift. To keep them correct we own the
-  // statistics while a specific level is selected and re-assert them on every
-  // relevant quiz event: "completed" stays a session-wide total of every item
-  // finished (across all levels), while "to go" and the progress bar describe
-  // just the selected level, using our own per-level completion counts.
+  // the `remainingCount` target, and it resets the quiz's internal item total to
+  // the *filtered* length. Once we auto-switch levels the native code derives
+  // "to go" and the progress bar from mismatched numbers, so both drift. We
+  // therefore own those two while a specific level is selected, and leave
+  // `completeCount` to WaniKani -- its value is already the session-wide total
+  // we want.
+  //
+  // A level's session total comes from the queue: every subject id we have ever
+  // seen at that level. How many of them are done comes from three signals,
+  // because each one alone has been observed to stall:
+  //   - The queue reconciles: on every manipulation, any previously seen id that
+  //     is no longer in the queue must be finished. Authoritative and
+  //     self-correcting, but manipulations are infrequent (a refresh, a level
+  //     switch, a skip) -- not one per answered item, so "to go" froze.
+  //   - `didCompleteSubject`, which used to tick the count between
+  //     manipulations. WaniKani no longer appears to deliver it (their event
+  //     modules list `did_answer_question` and `will_show_next_question`, but no
+  //     `did_complete_subject`), so it is kept only as a bonus.
+  //   - WaniKani's own "completed" counter, which we never write and which does
+  //     keep moving. Its increase since the last reconciliation is how many
+  //     subjects of the selected level are newly done, because a filtered queue
+  //     holds only that level's items.
+  // The lesson from two stuck-counter bugs is not to trust any single source:
+  // `completeCount` is never written (WaniKani's own value is already the
+  // session-wide total we want), and every signal can only move "done" forward
+  // from the last queue-derived baseline, so one going quiet costs freshness
+  // rather than pinning a count.
 
   /**
    * Resolve a Stimulus controller instance by identifier, or null if Stimulus
@@ -1131,38 +1319,107 @@
   }
 
   /**
-   * Record each level's total number of subjects for the session. The queue
-   * passed to the filter excludes finished items, so (remaining for a level) +
-   * (completed for that level) is its session total. This is recomputed from
-   * scratch on every manipulation rather than kept monotonic, so that if the
-   * session legitimately shrinks (e.g. items dropped during wrap-up, or an
-   * extra_study queue that is smaller), the total follows it down and "to go"
-   * can still reach 0.
+   * Remember that a subject belongs to this session, keyed by its level. The
+   * accumulated Set for a level is that level's session total: every subject we
+   * have seen in the queue, whether or not it is still there. Items answered
+   * incorrectly go back into the queue, and re-adding an id to a Set is a no-op,
+   * so a subject is counted exactly once however many times it comes around.
+   * @param {number} level - The subject's level
+   * @param {Object} queueItem - Queue item from wkQueue
+   * @returns {number|string|null} The recorded subject id, or null if unusable
    */
-  function captureSessionLevelTotals() {
-    for (const key of Object.keys(state.currentQueueLevelCounts)) {
-      const level = Number(key);
-      const remaining = state.currentQueueLevelCounts[level] || 0;
-      const completed = state.completedByLevel[level] || 0;
-      state.sessionLevelTotal[level] = remaining + completed;
+  function recordSessionSubject(level, queueItem) {
+    const rawId = queueItem && queueItem.item && queueItem.item.id;
+    if (!isUsableSubjectId(rawId)) {
+      return null;
     }
+    // Keyed as a string so ids arriving as numbers from the queue and as
+    // strings from an event land on the same Set entry.
+    const id = String(rawId);
+    if (!state.sessionLevelSubjects[level]) {
+      state.sessionLevelSubjects[level] = new Set();
+    }
+    state.sessionLevelSubjects[level].add(id);
+    return id;
   }
 
   /**
-   * Record a completed subject. Always bumps the session-wide completedTotal so
-   * the "completed" counter reflects every item finished this session, across
-   * all levels. Then attributes the subject to its level so the per-level "to
-   * go" count and progress bar can advance. Prefers the subject's real level
-   * from subjectLevelMap, but falls back to the selected level when that map
-   * has not loaded yet: while a specific level is filtered the queue only holds
-   * items of that level, so an unmapped completion necessarily belongs to it.
-   * Without the fallback, every completion answered before the (async) item
-   * data finished loading would be dropped, permanently under-counting the
-   * level for the rest of the session.
-   * @param {number} subjectId - The completed subject's id
+   * Reconcile the per-level completion sets against a freshly handed queue: a
+   * subject we have seen this session but that is no longer queued is finished,
+   * and one that is queued is not - however it came to be marked.
+   *
+   * Each level's set is rebuilt rather than added to, so the queue always has
+   * the last word. An item answered incorrectly can leave the queue and come
+   * back; if a manipulation caught it mid-flight, an add-only set would count it
+   * as finished forever and under-report "to go" for the rest of the session.
+   * Rebuilding also absorbs items dropped rather than answered (e.g. during
+   * wrap-up), so "to go" can still reach 0. Between manipulations - which are
+   * infrequent - didCompleteSubject tops the set up via markSubjectCompleted.
+   * @param {Set} idsStillQueued - Subject ids present in the current queue
    */
-  function recordCompletedSubject(subjectId) {
-    state.completedTotal += 1;
+  function reconcileCompletedSubjects(idsStillQueued) {
+    for (const key of Object.keys(state.sessionLevelSubjects)) {
+      const seen = state.sessionLevelSubjects[key];
+      const completed = new Set();
+      for (const id of seen) {
+        if (!idsStillQueued.has(id)) {
+          completed.add(id);
+        }
+      }
+      state.completedLevelSubjects[key] = completed;
+      state.reconciledBaseByLevel[key] = completed.size;
+    }
+    // Baseline for the native-counter signal: from here until the next
+    // reconciliation, every subject WaniKani counts as finished is one more
+    // subject of the selected level done (a filtered queue holds only that
+    // level's items).
+    state.nativeCompletedAtReconcile = readNativeCompletedCount();
+  }
+
+  /**
+   * Read WaniKani's own "completed" counter. We never write this element, so it
+   * is an independent, always-moving signal - unlike the quiz lifecycle events,
+   * which WaniKani renames, and unlike queue manipulations, which are
+   * infrequent.
+   * @returns {number|null} The count, or null if unavailable/unparseable
+   */
+  function readNativeCompletedCount() {
+    const target = document.querySelector('[data-quiz-statistics-target="completeCount"]');
+    if (!target) {
+      return null;
+    }
+    const value = Number.parseInt(target.textContent, 10);
+    return Number.isFinite(value) ? value : null;
+  }
+
+  /**
+   * How many subjects have been finished since the last queue reconciliation,
+   * according to WaniKani's own counter. Zero when the counter is unreadable or
+   * has gone backwards (it resets between sessions).
+   * @returns {number} Subjects completed since the last reconciliation
+   */
+  function completedSinceReconcile() {
+    const now = readNativeCompletedCount();
+    if (now === null || state.nativeCompletedAtReconcile === null) {
+      return 0;
+    }
+    return Math.max(0, now - state.nativeCompletedAtReconcile);
+  }
+
+  /**
+   * Mark a single subject as finished, keyed by level. Used by the
+   * didCompleteSubject listener so the counts move between manipulations.
+   * Prefers the subject's real level from subjectLevelMap and falls back to the
+   * selected level (while a level is filtered the queue only holds that level's
+   * items). The id is added to the level's "seen" set as well as its "completed"
+   * set, so a subject we somehow never observed in the queue cannot push the
+   * completed count past the session total.
+   * @param {number|string} subjectId - The completed subject's id
+   */
+  function markSubjectCompleted(subjectId) {
+    if (!isUsableSubjectId(subjectId)) {
+      return;
+    }
 
     let level = state.subjectLevelMap[subjectId];
     if (!Number.isFinite(level)) {
@@ -1171,7 +1428,56 @@
     if (!Number.isFinite(level)) {
       return;
     }
-    state.completedByLevel[level] = (state.completedByLevel[level] || 0) + 1;
+
+    const id = String(subjectId);
+    if (!state.sessionLevelSubjects[level]) {
+      state.sessionLevelSubjects[level] = new Set();
+    }
+    if (!state.completedLevelSubjects[level]) {
+      state.completedLevelSubjects[level] = new Set();
+    }
+    state.sessionLevelSubjects[level].add(id);
+    state.completedLevelSubjects[level].add(id);
+  }
+
+  /**
+   * Whether a value looks like a usable subject id (a number or a numeric-ish
+   * string, never an object or nullish).
+   * @param {*} id - The candidate id
+   * @returns {boolean} True if the value can be used as a Set key
+   */
+  function isUsableSubjectId(id) {
+    return typeof id === 'number' ? Number.isFinite(id) : typeof id === 'string' && id !== '';
+  }
+
+  /**
+   * Pull the completed subject's id out of a didCompleteSubject event. The
+   * payload shape has changed before, so several known shapes are tried; an
+   * unrecognised one yields null and simply leaves the counts to the next queue
+   * reconciliation.
+   * @param {Event} event - The didCompleteSubject event
+   * @returns {number|string|null} The subject id, or null if not found
+   */
+  function getCompletedSubjectId(event) {
+    const detail = event && event.detail;
+    if (!detail) {
+      return null;
+    }
+
+    const candidates = [
+      detail.subjectWithStats && detail.subjectWithStats.subject,
+      detail.subject,
+      detail.subjectWithStats
+    ];
+
+    for (const candidate of candidates) {
+      const id = candidate && candidate.id;
+      if (isUsableSubjectId(id)) {
+        return id;
+      }
+    }
+
+    return isUsableSubjectId(detail.subjectId) ? detail.subjectId : null;
   }
 
   /**
@@ -1191,12 +1497,13 @@
   }
 
   /**
-   * Re-assert the quiz statistics while a specific level is filtered. Rewrites
-   * the "completed" count to the session-wide total (every item finished across
-   * all levels) and the "to go" count plus progress bar to describe the selected
-   * level. No-op when no specific level is selected (the native counts are
-   * already correct for "All Levels") or when the statistics elements are not
-   * present.
+   * Re-assert the quiz statistics while a specific level is filtered: the "to
+   * go" count and the progress bar are rewritten to describe just the selected
+   * level. The "completed" counter is deliberately left alone -- WaniKani's own
+   * value is already the session-wide total we want, and owning it meant a stuck
+   * "0" whenever our completion tracking missed. No-op when no specific level is
+   * selected (the native counts are already right for "All Levels"), when we
+   * have not seen this level in the queue yet, or when the elements are absent.
    */
   function syncQuizStatistics() {
     const levelNum = getSelectedLevelNumber();
@@ -1204,26 +1511,33 @@
       return;
     }
 
-    const total = state.sessionLevelTotal[levelNum];
-    if (!Number.isFinite(total)) {
+    const sessionSubjects = state.sessionLevelSubjects[levelNum];
+    if (!sessionSubjects || sessionSubjects.size === 0) {
       return; // Haven't observed this level in the queue yet
     }
 
-    const completeTarget = document.querySelector('[data-quiz-statistics-target="completeCount"]');
     const remainingTarget = document.querySelector('[data-quiz-statistics-target="remainingCount"]');
-    if (!completeTarget || !remainingTarget) {
+    if (!remainingTarget) {
       return;
     }
 
-    const levelComplete = state.completedByLevel[levelNum] || 0;
-    const remaining = Math.max(0, total - levelComplete);
+    // The level's session total minus what we know is finished. Two signals
+    // report that, and we take whichever has got further: the completed set
+    // (queue-reconciled, topped up by didCompleteSubject) and the count of
+    // subjects WaniKani has marked done since that reconciliation. They are
+    // measured from the same baseline, so this is a choice between them rather
+    // than a sum - no double counting if both happen to be working.
+    const total = sessionSubjects.size;
+    const completedSubjects = state.completedLevelSubjects[levelNum];
+    const fromSet = completedSubjects ? completedSubjects.size : 0;
+    const fromNativeCounter = (state.reconciledBaseByLevel[levelNum] || 0) + completedSinceReconcile();
 
-    // "Completed" stays a session-wide total (every item finished across all
-    // levels); "to go" and the progress bar describe just the selected level.
-    completeTarget.textContent = String(state.completedTotal);
+    const levelComplete = Math.min(total, Math.max(fromSet, fromNativeCounter));
+    const remaining = total - levelComplete;
+
     remainingTarget.textContent = String(remaining);
 
-    const percentComplete = total > 0 ? Math.round((100 * levelComplete) / total) : 100;
+    const percentComplete = Math.round((100 * levelComplete) / total);
     updateQuizProgressBar(percentComplete);
   }
 
@@ -1237,9 +1551,11 @@
 
   /**
    * Register the quiz lifecycle listeners that keep the per-level statistics in
-   * sync. Registered once, early; recordCompletedSubject's selected-level
-   * fallback means completions still count even if one fires before the item
-   * data finishes loading.
+   * sync and re-assert them after WaniKani recomputes them. Only
+   * didCompleteSubject feeds the counts, and only additively on top of the
+   * queue-reconciled set, so an event WaniKani renames or stops firing costs
+   * freshness between manipulations rather than the counts themselves. Syncing
+   * more often than needed is harmless because it rewrites the same value.
    */
   function setupQuizStatisticsTracking() {
     if (state.statsListenersRegistered) {
@@ -1247,20 +1563,24 @@
     }
     state.statsListenersRegistered = true;
 
-    // A subject is fully answered: attribute it to its level, then re-sync.
+    // A subject was fully answered: attribute it to its level so "to go" ticks
+    // down before the next queue manipulation, then re-sync. An unrecognised
+    // payload just skips the attribution -- the next manipulation reconciles it.
     window.addEventListener('didCompleteSubject', (event) => {
-      const subject = event.detail
-        && event.detail.subjectWithStats
-        && event.detail.subjectWithStats.subject;
-      if (subject) {
-        recordCompletedSubject(subject.id);
-      }
+      markSubjectCompleted(getCompletedSubjectId(event));
       scheduleQuizStatisticsSync();
     });
 
     // A new question is shown (including right after a queue manipulation or
-    // level switch): re-assert the counts the native code may have recomputed.
-    window.addEventListener('willShowNextQuestion', scheduleQuizStatisticsSync);
+    // level switch), or a question was just answered: re-assert the counts the
+    // native code may have recomputed.
+    const syncEvents = [
+      'willShowNextQuestion',
+      'didAnswerQuestion'
+    ];
+    for (const eventName of syncEvents) {
+      window.addEventListener(eventName, scheduleQuizStatisticsSync);
+    }
   }
 
   // ============================================
@@ -1334,14 +1654,21 @@
     // Remove empty queue styling
     clearEmptyQueueUI();
 
+    // Undo the position:relative we forced onto WaniKani's scroll container
+    if (state.patchedScrollContainer) {
+      state.patchedScrollContainer.style.position = '';
+      state.patchedScrollContainer = null;
+    }
+
     // Reset dropdown reference
     state.dropdown = null;
 
     // Drop the session's statistics tracking so it can't leak into the next
     // review session (the window listeners outlive a single session).
-    state.completedTotal = 0;
-    state.completedByLevel = {};
-    state.sessionLevelTotal = {};
+    state.sessionLevelSubjects = {};
+    state.completedLevelSubjects = {};
+    state.reconciledBaseByLevel = {};
+    state.nativeCompletedAtReconcile = null;
   }
 
   // ============================================
