@@ -2,7 +2,7 @@
 // @name         WaniKani Level Filter
 // @namespace    wanikani-level-filter
 // @description  Filter reviews by level during active review sessions
-// @version      1.3.2
+// @version      1.4.0
 // @author       doutatsu
 // @match        https://www.wanikani.com/*
 // @match        https://preview.wanikani.com/*
@@ -165,15 +165,13 @@
     // Track levels with items in current queue (updated on each filter call)
     currentQueueLevels: new Set(),
     currentQueueLevelCounts: {},
-    // Quiz-statistics tracking (see SECTION 10.5). completedTotal counts every
-    // subject fully answered this session, across all levels, so the "completed"
-    // counter stays a session-wide total. completedByLevel counts those same
-    // subjects keyed by level, and sessionLevelTotal records each level's total
-    // for the session (completed + remaining); together they drive the per-level
-    // "to go" count and the progress bar for the selected level.
-    completedTotal: 0,
-    completedByLevel: {},
-    sessionLevelTotal: {},
+    // Quiz-statistics tracking (see SECTION 10.5). sessionLevelSubjects maps a
+    // level to the Set of subject ids seen in the queue at any point this
+    // session, so its size is that level's session total. The queue we are
+    // handed excludes finished items, so (session total) - (items of that level
+    // still in the queue) is how many are done. Deriving it this way needs no
+    // quiz lifecycle events, which WaniKani renames from time to time.
+    sessionLevelSubjects: {},
     statsListenersRegistered: false,
     // Track if user intentionally clicked home button
     userClickedHome: false,
@@ -225,9 +223,7 @@
     state.availableLevels = [];
     state.levelCounts = {};
     // Start the session's statistics tracking from a clean slate
-    state.completedTotal = 0;
-    state.completedByLevel = {};
-    state.sessionLevelTotal = {};
+    state.sessionLevelSubjects = {};
 
     const config = {
       wk_items: {
@@ -690,7 +686,9 @@
     // Remove empty queue styling first
     clearEmptyQueueUI();
 
-    // Track what levels are available in the current queue
+    // Track what levels are available in the current queue, and remember every
+    // subject we have ever seen so the statistics can work out each level's
+    // session total (see SECTION 10.5).
     state.currentQueueLevels.clear();
     state.currentQueueLevelCounts = {};
     for (const queueItem of queue) {
@@ -698,14 +696,9 @@
       if (itemLevel !== null) {
         state.currentQueueLevels.add(itemLevel);
         state.currentQueueLevelCounts[itemLevel] = (state.currentQueueLevelCounts[itemLevel] || 0) + 1;
+        recordSessionSubject(itemLevel, queueItem);
       }
     }
-
-    // The queue handed to us excludes already-finished items, so for each level
-    // (remaining items) + (items completed so far) is that level's session
-    // total. Record it so the statistics can derive the "completed"/"to go"
-    // split for whichever level is selected.
-    captureSessionLevelTotals();
 
     // Ensure UI exists and update dropdown to reflect current queue state
     if (!state.dropdown) {
@@ -1145,15 +1138,19 @@
   //   - `quiz-progress` draws the progress bar via updateProgress({ detail:
   //     { percentComplete } }).
   // When the queue is filtered, the Queue Manipulator rewrites the queue and
-  // the `remainingCount` target, but it never touches `completeCount`, and it
-  // resets the quiz's internal item total to the *filtered* length. Once we
-  // auto-switch levels the native code derives the counts from mismatched
-  // numbers (a session-wide "completed" against a per-level total), so both
-  // counts and the progress bar drift. To keep them correct we own the
-  // statistics while a specific level is selected and re-assert them on every
-  // relevant quiz event: "completed" stays a session-wide total of every item
-  // finished (across all levels), while "to go" and the progress bar describe
-  // just the selected level, using our own per-level completion counts.
+  // the `remainingCount` target, and it resets the quiz's internal item total to
+  // the *filtered* length. Once we auto-switch levels the native code derives
+  // "to go" and the progress bar from mismatched numbers, so both drift. We
+  // therefore own those two while a specific level is selected, and leave
+  // `completeCount` to WaniKani -- its value is already the session-wide total
+  // we want.
+  //
+  // The numbers are derived from the queue we are handed, never from a quiz
+  // lifecycle event. An earlier version counted completions from the
+  // `didCompleteSubject` event; when that stopped delivering, the counters stuck
+  // at zero and we overwrote WaniKani's correct "completed" with it for the rest
+  // of the session. The queue is data we already receive and cannot silently
+  // stop arriving, so it is the safer thing to trust.
 
   /**
    * Resolve a Stimulus controller instance by identifier, or null if Stimulus
@@ -1174,47 +1171,23 @@
   }
 
   /**
-   * Record each level's total number of subjects for the session. The queue
-   * passed to the filter excludes finished items, so (remaining for a level) +
-   * (completed for that level) is its session total. This is recomputed from
-   * scratch on every manipulation rather than kept monotonic, so that if the
-   * session legitimately shrinks (e.g. items dropped during wrap-up, or an
-   * extra_study queue that is smaller), the total follows it down and "to go"
-   * can still reach 0.
+   * Remember that a subject belongs to this session, keyed by its level. The
+   * accumulated Set for a level is that level's session total: every subject we
+   * have seen in the queue, whether or not it is still there. Items answered
+   * incorrectly go back into the queue, and re-adding an id to a Set is a no-op,
+   * so a subject is counted exactly once however many times it comes around.
+   * @param {number} level - The subject's level
+   * @param {Object} queueItem - Queue item from wkQueue
    */
-  function captureSessionLevelTotals() {
-    for (const key of Object.keys(state.currentQueueLevelCounts)) {
-      const level = Number(key);
-      const remaining = state.currentQueueLevelCounts[level] || 0;
-      const completed = state.completedByLevel[level] || 0;
-      state.sessionLevelTotal[level] = remaining + completed;
-    }
-  }
-
-  /**
-   * Record a completed subject. Always bumps the session-wide completedTotal so
-   * the "completed" counter reflects every item finished this session, across
-   * all levels. Then attributes the subject to its level so the per-level "to
-   * go" count and progress bar can advance. Prefers the subject's real level
-   * from subjectLevelMap, but falls back to the selected level when that map
-   * has not loaded yet: while a specific level is filtered the queue only holds
-   * items of that level, so an unmapped completion necessarily belongs to it.
-   * Without the fallback, every completion answered before the (async) item
-   * data finished loading would be dropped, permanently under-counting the
-   * level for the rest of the session.
-   * @param {number} subjectId - The completed subject's id
-   */
-  function recordCompletedSubject(subjectId) {
-    state.completedTotal += 1;
-
-    let level = state.subjectLevelMap[subjectId];
-    if (!Number.isFinite(level)) {
-      level = getSelectedLevelNumber();
-    }
-    if (!Number.isFinite(level)) {
+  function recordSessionSubject(level, queueItem) {
+    const id = queueItem && queueItem.item && queueItem.item.id;
+    if (id === undefined || id === null) {
       return;
     }
-    state.completedByLevel[level] = (state.completedByLevel[level] || 0) + 1;
+    if (!state.sessionLevelSubjects[level]) {
+      state.sessionLevelSubjects[level] = new Set();
+    }
+    state.sessionLevelSubjects[level].add(id);
   }
 
   /**
@@ -1234,12 +1207,13 @@
   }
 
   /**
-   * Re-assert the quiz statistics while a specific level is filtered. Rewrites
-   * the "completed" count to the session-wide total (every item finished across
-   * all levels) and the "to go" count plus progress bar to describe the selected
-   * level. No-op when no specific level is selected (the native counts are
-   * already correct for "All Levels") or when the statistics elements are not
-   * present.
+   * Re-assert the quiz statistics while a specific level is filtered: the "to
+   * go" count and the progress bar are rewritten to describe just the selected
+   * level. The "completed" counter is deliberately left alone -- WaniKani's own
+   * value is already the session-wide total we want, and owning it meant a stuck
+   * "0" whenever our completion tracking missed. No-op when no specific level is
+   * selected (the native counts are already right for "All Levels"), when we
+   * have not seen this level in the queue yet, or when the elements are absent.
    */
   function syncQuizStatistics() {
     const levelNum = getSelectedLevelNumber();
@@ -1247,26 +1221,25 @@
       return;
     }
 
-    const total = state.sessionLevelTotal[levelNum];
-    if (!Number.isFinite(total)) {
+    const sessionSubjects = state.sessionLevelSubjects[levelNum];
+    if (!sessionSubjects || sessionSubjects.size === 0) {
       return; // Haven't observed this level in the queue yet
     }
 
-    const completeTarget = document.querySelector('[data-quiz-statistics-target="completeCount"]');
     const remainingTarget = document.querySelector('[data-quiz-statistics-target="remainingCount"]');
-    if (!completeTarget || !remainingTarget) {
+    if (!remainingTarget) {
       return;
     }
 
-    const levelComplete = state.completedByLevel[levelNum] || 0;
-    const remaining = Math.max(0, total - levelComplete);
+    // Everything comes from the queue itself: what is left for this level is the
+    // "to go" count, and the rest of the level's session total is done.
+    const total = sessionSubjects.size;
+    const remaining = Math.min(total, state.currentQueueLevelCounts[levelNum] || 0);
+    const levelComplete = total - remaining;
 
-    // "Completed" stays a session-wide total (every item finished across all
-    // levels); "to go" and the progress bar describe just the selected level.
-    completeTarget.textContent = String(state.completedTotal);
     remainingTarget.textContent = String(remaining);
 
-    const percentComplete = total > 0 ? Math.round((100 * levelComplete) / total) : 100;
+    const percentComplete = Math.round((100 * levelComplete) / total);
     updateQuizProgressBar(percentComplete);
   }
 
@@ -1279,10 +1252,12 @@
   }
 
   /**
-   * Register the quiz lifecycle listeners that keep the per-level statistics in
-   * sync. Registered once, early; recordCompletedSubject's selected-level
-   * fallback means completions still count even if one fires before the item
-   * data finishes loading.
+   * Register the quiz lifecycle listeners that re-assert the per-level
+   * statistics after WaniKani recomputes them. These are only triggers: the
+   * numbers themselves come from the queue, so an event WaniKani renames or
+   * stops firing costs us a little freshness rather than the counts. Several
+   * events are listened for so a rename cannot silence all of them; syncing more
+   * often than needed is harmless because it just rewrites the same value.
    */
   function setupQuizStatisticsTracking() {
     if (state.statsListenersRegistered) {
@@ -1290,20 +1265,17 @@
     }
     state.statsListenersRegistered = true;
 
-    // A subject is fully answered: attribute it to its level, then re-sync.
-    window.addEventListener('didCompleteSubject', (event) => {
-      const subject = event.detail
-        && event.detail.subjectWithStats
-        && event.detail.subjectWithStats.subject;
-      if (subject) {
-        recordCompletedSubject(subject.id);
-      }
-      scheduleQuizStatisticsSync();
-    });
-
     // A new question is shown (including right after a queue manipulation or
-    // level switch): re-assert the counts the native code may have recomputed.
-    window.addEventListener('willShowNextQuestion', scheduleQuizStatisticsSync);
+    // level switch), or a question/subject was just answered: re-assert the
+    // counts the native code may have recomputed.
+    const syncEvents = [
+      'willShowNextQuestion',
+      'didAnswerQuestion',
+      'didCompleteSubject'
+    ];
+    for (const eventName of syncEvents) {
+      window.addEventListener(eventName, scheduleQuizStatisticsSync);
+    }
   }
 
   // ============================================
@@ -1382,9 +1354,7 @@
 
     // Drop the session's statistics tracking so it can't leak into the next
     // review session (the window listeners outlive a single session).
-    state.completedTotal = 0;
-    state.completedByLevel = {};
-    state.sessionLevelTotal = {};
+    state.sessionLevelSubjects = {};
   }
 
   // ============================================
