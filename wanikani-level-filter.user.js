@@ -2,7 +2,7 @@
 // @name         WaniKani Level Filter
 // @namespace    wanikani-level-filter
 // @description  Filter reviews by level during active review sessions
-// @version      1.5.0
+// @version      1.6.0
 // @author       doutatsu
 // @match        https://www.wanikani.com/*
 // @match        https://preview.wanikani.com/*
@@ -45,6 +45,7 @@
   const HEADER_CHECK_INTERVAL = 100; // ms
   const HEADER_TIMEOUT = 5000; // ms
   const EMPTY_QUEUE_CLASS = 'level-filter-empty-queue';
+  const NOTIFICATION_CLASS = 'level-filter-notification';
 
   const UI_IDS = {
     container: 'level-filter-container',
@@ -54,34 +55,22 @@
   };
 
   const STYLES = {
-    dropdown: `
-      margin: 0;
-      padding: 3px 6px;
-      font-size: 11px;
-      border: 1px solid #999;
-      border-radius: 3px;
-      background: white;
-      cursor: pointer;
-      min-width: 100px;
-    `,
-    sortToggle: `
-      margin: 0;
-      padding: 3px 8px;
-      font-size: 11px;
-      line-height: 1;
-      border: 1px solid #999;
-      border-radius: 3px;
-      background: white;
-      cursor: pointer;
-      white-space: nowrap;
-    `,
+    // Only the container is styled inline, because its positioning is swapped
+    // at runtime (absolute inside the scroll container vs fixed while the quiz
+    // is hidden). Everything else lives in UI_CSS so that hover/active/focus
+    // rules are not outranked by inline styles.
+    // Radius is concentric with the controls inside it: 6px inner + 4px of
+    // vertical padding = 10px outer.
     containerBase: `
       display: flex;
       align-items: center;
       gap: 6px;
       padding: 4px 8px;
       background: rgba(0, 0, 0, 0.6);
-      border-radius: 4px;
+      border-radius: 10px;
+      box-shadow:
+        0 1px 2px oklch(0 0 0 / 0.24),
+        0 4px 12px oklch(0 0 0 / 0.16);
     `,
     containerAbsolute: `
       position: absolute;
@@ -98,24 +87,21 @@
       left: 10px;
       z-index: 100001;
     `,
-    label: `
-      color: white;
-      font-size: 12px;
-      font-weight: 500;
-    `,
     noItemsMessage: `
       position: fixed;
       top: 50%;
       left: 50%;
       transform: translate(-50%, -50%);
       background: white;
-      border: 2px solid #ffc107;
       padding: 30px;
-      border-radius: 10px;
+      border-radius: 12px;
       z-index: 100000;
       max-width: 500px;
       text-align: center;
-      box-shadow: 0 4px 16px rgba(0,0,0,0.2);
+      box-shadow:
+        0 0 0 1px oklch(0.75 0.15 85 / 0.9),
+        0 2px 4px oklch(0 0 0 / 0.08),
+        0 12px 32px oklch(0 0 0 / 0.18);
     `,
     notification: `
       position: fixed;
@@ -125,12 +111,14 @@
       background: #4a90e2;
       color: white;
       padding: 12px 24px;
-      border-radius: 5px;
+      border-radius: 8px;
       z-index: 100000;
       font-size: 14px;
       font-weight: 500;
-      box-shadow: 0 2px 8px rgba(0,0,0,0.2);
-      animation: wkLevelFilterSlideDown 0.3s ease;
+      box-shadow:
+        0 1px 2px oklch(0 0 0 / 0.16),
+        0 8px 24px oklch(0 0 0 / 0.18);
+      animation: wkLevelFilterSlideDown 0.24s cubic-bezier(0.2, 0, 0, 1);
     `
   };
 
@@ -161,6 +149,91 @@
     }
   `;
 
+  // Styling for the menu's controls. Kept in a stylesheet rather than inline so
+  // that :hover/:active/:focus-visible can actually take effect - an inline
+  // style would outrank them - and scoped by id + parent id so WaniKani's own
+  // form styling does not win on specificity.
+  const UI_CSS = `
+    #${UI_IDS.container} label {
+      color: #fff;
+      font-size: 12px;
+      font-weight: 500;
+      /* Nudge off the pill's left edge so it is optically centred against the
+         control to its right, which carries a 1px ring of its own. */
+      padding-left: 1px;
+    }
+
+    #${UI_IDS.container} #${UI_IDS.dropdown},
+    #${UI_IDS.container} #${UI_IDS.sortToggle} {
+      margin: 0;
+      font-size: 11px;
+      line-height: 1;
+      color: #1a1a1a;
+      background: #fff;
+      border: 0;
+      border-radius: 6px;
+      cursor: pointer;
+      /* Elevation, not structure: a hairline ring plus a soft drop shadow,
+         both transparent so they sit correctly on any backdrop. */
+      box-shadow:
+        0 0 0 1px oklch(0 0 0 / 0.14),
+        0 1px 2px oklch(0 0 0 / 0.12);
+      transition-property: background-color, box-shadow, scale;
+      transition-duration: 120ms;
+      transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
+    }
+
+    #${UI_IDS.container} #${UI_IDS.dropdown} {
+      padding: 4px 6px;
+      min-width: 100px;
+    }
+
+    #${UI_IDS.container} #${UI_IDS.sortToggle} {
+      padding: 4px 8px;
+      white-space: nowrap;
+      text-align: center;
+      /* Hold a constant width across "SRS ↓" / "SRS ↑" / "SRS —" so cycling the
+         mode does not resize the pill under the pointer. */
+      min-width: 58px;
+    }
+
+    #${UI_IDS.container} #${UI_IDS.dropdown}:hover,
+    #${UI_IDS.container} #${UI_IDS.sortToggle}:hover {
+      background: #f2f2f2;
+      box-shadow:
+        0 0 0 1px oklch(0 0 0 / 0.2),
+        0 1px 3px oklch(0 0 0 / 0.16);
+    }
+
+    /* Tactile press. Only the toggle: a native select opens its popup on
+       pointer-down, so scaling it would animate against the open menu. */
+    #${UI_IDS.container} #${UI_IDS.sortToggle}:active {
+      background: #e8e8e8;
+      scale: 0.96;
+    }
+
+    #${UI_IDS.container} #${UI_IDS.dropdown}:focus-visible,
+    #${UI_IDS.container} #${UI_IDS.sortToggle}:focus-visible {
+      outline: none;
+      box-shadow:
+        0 0 0 1px oklch(0 0 0 / 0.2),
+        0 0 0 3px oklch(0.62 0.19 255 / 0.65);
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      #${UI_IDS.container} #${UI_IDS.dropdown},
+      #${UI_IDS.container} #${UI_IDS.sortToggle} {
+        transition-duration: 1ms;
+      }
+      #${UI_IDS.container} #${UI_IDS.sortToggle}:active {
+        scale: 1;
+      }
+      .${NOTIFICATION_CLASS} {
+        animation: none !important;
+      }
+    }
+  `;
+
   // ============================================
   // SECTION 2: GLOBAL STATE
   // ============================================
@@ -174,6 +247,12 @@
     // Track levels with items in current queue (updated on each filter call)
     currentQueueLevels: new Set(),
     currentQueueLevelCounts: {},
+    // Levels finished this session. The queue we are handed keeps listing
+    // subjects the user has already answered (the same staleness that used to
+    // freeze the "to go" counter), so a level's queue count never reaching zero
+    // is not evidence it still has work. Without this, a finished level stays in
+    // the dropdown and the auto-switch sends the user back round to it.
+    exhaustedLevels: new Set(),
     // Quiz-statistics tracking (see SECTION 10.5). sessionLevelSubjects maps a
     // level to the Set of subject ids seen in the queue at any point this
     // session, so its size is that level's session total.
@@ -219,7 +298,7 @@
    */
   function injectCSS() {
     const style = document.createElement('style');
-    style.textContent = EMPTY_QUEUE_CSS;
+    style.textContent = EMPTY_QUEUE_CSS + UI_CSS;
     document.head.appendChild(style);
   }
 
@@ -250,6 +329,7 @@
     state.completedLevelSubjects = {};
     state.reconciledBaseByLevel = {};
     state.nativeCompletedAtReconcile = null;
+    state.exhaustedLevels = new Set();
 
     const config = {
       wk_items: {
@@ -387,7 +467,6 @@
 
     const label = createElement('label', {
       text: 'Level:',
-      cssText: STYLES.label,
       attrs: { for: UI_IDS.dropdown }
     });
 
@@ -407,7 +486,6 @@
   function createSortToggle() {
     const button = createElement('button', {
       id: UI_IDS.sortToggle,
-      cssText: STYLES.sortToggle,
       attrs: { type: 'button' }
     });
 
@@ -465,7 +543,6 @@
   function createLevelDropdown(counts) {
     const dropdown = document.createElement('select');
     dropdown.id = UI_IDS.dropdown;
-    dropdown.style.cssText = STYLES.dropdown;
     dropdown.setAttribute('aria-label', 'Filter by level');
 
     // Add "All Levels" option with total count
@@ -520,7 +597,7 @@
   function updateDropdownOptions() {
     if (!state.dropdown) return;
 
-    const counts = state.currentQueueLevelCounts;
+    const counts = selectableQueueLevelCounts();
     const currentValue = state.dropdown.value;
 
     // Clear existing options
@@ -856,6 +933,14 @@
 
     // If no items match, find the closest level with items in the current queue
     if (filteredQueue.length === 0) {
+      // The queue holds nothing for this level, so it is done - but only trust
+      // that if we recognised levels at all. Before the item data loads every
+      // item's level is unknown, which would otherwise look like every level
+      // being finished at once.
+      if (state.currentQueueLevels.size > 0) {
+        markLevelExhausted(selectedLevelNum);
+      }
+
       const closestLevel = findClosestLevelWithItems(queue, selectedLevelNum);
 
       if (closestLevel !== null) {
@@ -897,11 +982,14 @@
    * @returns {number|null} Closest level with items, or null if none
    */
   function findClosestLevelWithItems(queue, targetLevel) {
-    // Build a set of levels that actually have items in the current queue
+    // Build a set of levels that actually have items left to do. A level the
+    // user has already finished still appears in the queue (see
+    // state.exhaustedLevels), so it must be excluded or we would hand the user
+    // straight back to a level they just cleared.
     const levelsWithItems = new Set();
     for (const queueItem of queue) {
       const itemLevel = getQueueItemLevel(queueItem);
-      if (itemLevel !== null && itemLevel !== targetLevel) {
+      if (itemLevel !== null && itemLevel !== targetLevel && !isLevelExhausted(itemLevel)) {
         levelsWithItems.add(itemLevel);
       }
     }
@@ -1071,17 +1159,20 @@
    */
   function showLevelSwitchNotification(fromLevel, toLevel, itemCount) {
     const notification = createElement('div', {
-      cssText: STYLES.notification
+      cssText: STYLES.notification,
+      attrs: { class: NOTIFICATION_CLASS }
     });
 
     notification.textContent = `Level ${fromLevel} complete! Switched to Level ${toLevel} (${itemCount} items)`;
 
     document.body.appendChild(notification);
 
-    // Auto-remove after 3 seconds
+    // Auto-remove after 3 seconds. The exit is quicker and shallower than the
+    // entrance - it only has to get out of the way, not announce itself - and
+    // eases out like the entrance rather than easing in and out.
     setTimeout(() => {
-      notification.style.animation = 'wkLevelFilterSlideUp 0.3s ease';
-      setTimeout(() => notification.remove(), 300);
+      notification.style.animation = 'wkLevelFilterSlideUp 0.18s cubic-bezier(0.2, 0, 0, 1) forwards';
+      setTimeout(() => notification.remove(), 180);
     }, 3000);
   }
 
@@ -1135,10 +1226,16 @@
       const selectedLevelNum = Number.parseInt(selectedLevel, 10);
       if (!Number.isFinite(selectedLevelNum)) return;
 
-      // Check if there are other levels with items in the current queue
-      const otherLevels = [...state.currentQueueLevels].filter(l => l !== selectedLevelNum);
+      // WaniKani is trying to end the session, which means the selected level
+      // has genuinely run out - the most reliable "level finished" signal we
+      // get, since the queue itself keeps listing answered subjects.
+      markLevelExhausted(selectedLevelNum);
 
-      if (otherLevels.length === 0) return; // No other levels, allow redirect
+      // Check which other levels still have work left
+      const otherLevels = [...state.currentQueueLevels]
+        .filter(l => l !== selectedLevelNum && !isLevelExhausted(l));
+
+      if (otherLevels.length === 0) return; // Nothing left anywhere, allow redirect
 
       // Find closest level
       let closestLevel = null;
@@ -1203,6 +1300,42 @@
     }
 
     return Number.isFinite(value) ? value : null;
+  }
+
+  /**
+   * Record that a level has no work left this session, so it stops being
+   * offered in the dropdown and stops being a candidate to auto-switch to.
+   * @param {number} level - The finished level
+   */
+  function markLevelExhausted(level) {
+    if (Number.isFinite(level)) {
+      state.exhaustedLevels.add(level);
+    }
+  }
+
+  /**
+   * Whether a level has already been finished this session.
+   * @param {number} level - The level to test
+   * @returns {boolean} True if the level is done
+   */
+  function isLevelExhausted(level) {
+    return state.exhaustedLevels.has(level);
+  }
+
+  /**
+   * The current queue's per-level counts with finished levels removed - i.e.
+   * the levels the user can still usefully pick.
+   * @returns {Object} Object mapping level -> count
+   */
+  function selectableQueueLevelCounts() {
+    const counts = {};
+    for (const key of Object.keys(state.currentQueueLevelCounts)) {
+      const level = Number(key);
+      if (!isLevelExhausted(level)) {
+        counts[level] = state.currentQueueLevelCounts[key];
+      }
+    }
+    return counts;
   }
 
   /**
@@ -1669,6 +1802,7 @@
     state.completedLevelSubjects = {};
     state.reconciledBaseByLevel = {};
     state.nativeCompletedAtReconcile = null;
+    state.exhaustedLevels = new Set();
   }
 
   // ============================================
